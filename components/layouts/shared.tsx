@@ -5,5 +5,6 @@ export function baseOptions(): BaseLayoutProps {
     nav: {
       title: 'sBPF Book',
     },
+    githubUrl: 'https://github.com/solana-asm/sbpf-book',
   };
 }
