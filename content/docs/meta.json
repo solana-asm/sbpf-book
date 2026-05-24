@@ -1,0 +1,16 @@
+{
+  "title": "The sBPF Programming Book",
+  "pages": [
+    "index",
+    "---Getting Started---",
+    "installation",
+    "quickstart",
+    "---Assembly---",
+    "assembly",
+    "---Core Concepts---",
+    "basics",
+    "---Reference---",
+    "program-development",
+    "...contributing"
+  ]
+}

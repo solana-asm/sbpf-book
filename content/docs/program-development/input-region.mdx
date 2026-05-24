@@ -1,0 +1,73 @@
+---
+title: Input Region Layout
+description: Byte-by-byte layout of the buffer the runtime places at r1 on entry to your program.
+---
+
+Reference for the serialised input buffer at `r1` on program entry. For the conceptual walkthrough, see [Program Structure](/docs/basics/program-structure).
+
+## Top-level structure
+
+| Field | Size | Notes |
+|---|---:|---|
+| `num_accounts` | 8 bytes | u64, total accounts passed to this instruction |
+| accounts | `N × 0x2860` bytes | each non-duplicate account is exactly `0x2860` |
+| `instruction_data_len` | 8 bytes | u64 |
+| `instruction_data` | `ix_len` bytes | the bytes the caller passed |
+| `program_id` | 32 bytes | the pubkey of the program being executed |
+
+## Per-account block (`0x2860` bytes)
+
+| Offset (from account start) | Size | Field | Type |
+|---:|---:|---|---|
+| `+0x00` | 1 | `dup_flag` | u8, `0xff` for unique accounts |
+| `+0x01` | 1 | `is_signer` | u8, `0` or `1` |
+| `+0x02` | 1 | `is_writable` | u8, `0` or `1` |
+| `+0x03` | 1 | `is_executable` | u8, `0` or `1` |
+| `+0x04` | 4 | padding | always zero |
+| `+0x08` | 32 | `pubkey` | the account's address |
+| `+0x28` | 32 | `owner` | program ID that owns this account's data |
+| `+0x48` | 8 | `lamports` | u64 balance |
+| `+0x50` | 8 | `data_len` | u64, actual bytes used |
+| `+0x58` | 10240 | `data` + padding | actual data plus `MAX_PERMITTED_DATA_INCREASE` |
+| `+0x2858` | 8 | `rent_epoch` | u64 |
+
+Block total: `1 + 1 + 1 + 1 + 4 + 32 + 32 + 8 + 8 + 10240 + 8 = 10336` bytes = `0x2860`.
+
+## Instruction data and program ID offsets
+
+| Accounts | `instruction_data_len` | `instruction_data` | `program_id` |
+|---:|---:|---:|---:|
+| 0 | `0x0008` | `0x0010` | `0x0010 + ix_len` |
+| 1 | `0x2868` | `0x2870` | `0x2870 + ix_len` |
+| 2 | `0x50c8` | `0x50d0` | `0x50d0 + ix_len` |
+| 3 | `0x7928` | `0x7930` | `0x7930 + ix_len` |
+
+Pattern: `instruction_data_len = 0x0008 + N × 0x2860` where `N` is the account count.
+
+## Standard `.equ` block for a one-account program
+
+```asm
+.equ NUM_ACCOUNTS,         0x0000
+
+.equ ACCT0_HEADER,         0x0008
+.equ ACCT0_KEY,            0x0010
+.equ ACCT0_OWNER,          0x0030
+.equ ACCT0_LAMPORTS,       0x0050
+.equ ACCT0_DATA_LEN,       0x0058
+.equ ACCT0_DATA,           0x0060
+.equ ACCT0_RENT_EPOCH,     0x2860
+
+.equ INSTRUCTION_DATA_LEN, 0x2868
+.equ INSTRUCTION_DATA,     0x2870
+```
+
+For each additional account, add an `ACCT<N>_*` block at offsets shifted by `0x2860`, and push `INSTRUCTION_DATA_LEN` / `INSTRUCTION_DATA` down by the same amount.
+
+## Memory regions (virtual addresses)
+
+| Region | Base | Size | Writable | Notes |
+|---|---|---|---|---|
+| Program | `0x100000000` | varies | no | `.text` + `.rodata` |
+| Stack | `0x200000000` | 4 KB | yes | grows downward; `r10` points at top |
+| Heap | `0x300000000` | 32 KB | yes | opt-in; rarely used in pure asm |
+| Input | `0x400000000` | varies | mixed | what `r1` points at on entry |

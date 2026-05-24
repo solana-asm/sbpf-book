@@ -1,0 +1,200 @@
+---
+title: Instructions
+description: The sBPF instruction set, grouped by purpose. Move data, do arithmetic, branch, and call syscalls.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+Every sBPF instruction is exactly 8 bytes long, except for `lddw` which is 16 bytes because it has to fit a 64-bit immediate. This means program size in bytes is roughly `instruction_count * 8`, and compute units consumed (for non-syscall instructions) is roughly `instruction_count`. Knowing the instruction set means knowing both the cost and the shape of any program you write.
+
+The instructions in this chapter are everything you need to write any program in this book. There are more in the full sBPF instruction set (rotations, byte swaps, atomics), but a complete program never needs them.
+
+We group the instructions into four families: data movement, arithmetic, control flow, and syscalls plus exit.
+
+## Family 1: data movement
+
+These instructions move bytes between registers and between registers and memory. They are the workhorse of every program.
+
+### `mov64 dst, src`
+
+Sets the value of register `dst` to `src`. The source can be either another register or an immediate.
+
+```asm
+mov64 r0, 0        # r0 = 0  (immediate source)
+mov64 r2, r1       # r2 = r1 (register source)
+```
+
+There is also a 32-bit `mov` variant. You will rarely want it; registers are 64-bit and almost every value of interest is a 64-bit pointer or u64. When in doubt, use `mov64`.
+
+The immediate is limited to 32 bits in `mov64`. To put a value larger than `2^32 - 1` (or the address of a label) into a register, use `lddw`.
+
+### `lddw rN, IMM`
+
+Loads a 64-bit immediate or a label address into a register. This is the only 16-byte instruction in the set. Use it for addresses of `.rodata` constants or for any constant that does not fit in 32 bits.
+
+```asm
+lddw r1, message              # r1 = address of the label "message"
+lddw r3, 0x1234567890abcdef   # r3 = a 64-bit constant
+```
+
+### Loads from memory: `ldxb`, `ldxh`, `ldxw`, `ldxdw`
+
+These read bytes from a memory address into a register. The suffix names the size.
+
+| Instruction | Reads | Alignment required |
+|---|---|---|
+| `ldxb rN, [base + offset]` | 1 byte (zero-extended into the 64-bit register) | none |
+| `ldxh rN, [base + offset]` | 2 bytes | 2-byte aligned |
+| `ldxw rN, [base + offset]` | 4 bytes | 4-byte aligned |
+| `ldxdw rN, [base + offset]` | 8 bytes | 8-byte aligned |
+
+The syntax `[base + offset]` means "compute the address by adding `base` (a register) and `offset` (a 16-bit signed immediate), then read from there." A load smaller than 8 bytes leaves the upper bits of the destination register as zero.
+
+```asm
+ldxb  r2, [r1 + 1]         # read 1 byte at (r1+1) into r2, upper 56 bits = 0
+ldxdw r3, [r1 + 0x2870]    # read 8 bytes at (r1+0x2870) into r3
+```
+
+The offset is bounded to `-32768` through `+32767`. To address farther than that, add a large value into another register first and use that as the base.
+
+<Callout type="warn">
+  Misaligned reads trap. `ldxdw r2, [r1 + 1]` is well-formed assembly but if `r1 + 1` is not 8-byte-aligned at runtime, the transaction aborts. The book's offset tables for the input region are designed so every field is naturally aligned.
+</Callout>
+
+### Stores to memory: `stxb`, `stxh`, `stxw`, `stxdw`
+
+The counterpart to the loads. Same size suffixes, same alignment rules.
+
+| Instruction | Writes |
+|---|---|
+| `stxb [base + offset], src` | 1 byte (low byte of `src`) |
+| `stxh [base + offset], src` | 2 bytes |
+| `stxw [base + offset], src` | 4 bytes |
+| `stxdw [base + offset], src` | 8 bytes |
+
+```asm
+stxdw [r9 + 0], r2     # write the 8 bytes of r2 to (r9 + 0)
+stxb  [r9 + 8], r3     # write the low byte of r3 to (r9 + 8)
+```
+
+The operand order is destination first, source second. This matches `mov` and many but not all other assembly dialects. Worth memorising once.
+
+## Family 2: arithmetic
+
+Standard integer arithmetic on 64-bit registers. The destination is always the first operand. The second operand can be a register or an immediate.
+
+### `add64`, `sub64`, `mul64`, `div64`
+
+```asm
+add64 r2, 1          # r2 = r2 + 1
+sub64 r1, 40         # r1 = r1 - 40
+mul64 r2, 8          # r2 = r2 * 8
+div64 r2, 16         # r2 = r2 / 16 (unsigned)
+add64 r2, r3         # r2 = r2 + r3
+```
+
+`div64` is unsigned. For signed division, use `sdiv64`. Twos-complement arithmetic means `add64` and `sub64` work identically for signed and unsigned values; only division (and the comparison-jumps below) care about signedness.
+
+### 32-bit variants
+
+`add`, `sub`, `mul`, `div` exist as 32-bit operations. They operate on the low 32 bits of the register and zero the upper 32 bits. You will rarely use these; almost every value of interest is 64 bits.
+
+### Bitwise: `and64`, `or64`, `xor64`, `lsh64`, `rsh64`
+
+```asm
+and64 r2, 0xff       # r2 = r2 & 0xff (mask to low byte)
+or64  r2, r3         # r2 = r2 | r3
+xor64 r2, r3         # r2 = r2 ^ r3
+lsh64 r2, 8          # r2 = r2 << 8 (logical shift left)
+rsh64 r2, 8          # r2 = r2 >> 8 (logical shift right)
+```
+
+`arsh64` is the arithmetic right shift (sign-extending). Use it only when you know you have a signed integer and want sign extension.
+
+## Family 3: control flow
+
+The instructions that change which instruction runs next.
+
+### Conditional jumps with baked-in comparison
+
+Unlike x86 or ARM, sBPF does not have a separate compare instruction followed by a branch. Every conditional jump encodes the comparison itself, in one instruction.
+
+| Instruction | Meaning |
+|---|---|
+| `jeq dst, src, label` | Jump to `label` if `dst == src` |
+| `jne dst, src, label` | Jump to `label` if `dst != src` |
+| `jgt dst, src, label` | Jump to `label` if `dst > src` (unsigned) |
+| `jge dst, src, label` | Jump to `label` if `dst >= src` (unsigned) |
+| `jlt dst, src, label` | Jump to `label` if `dst < src` (unsigned) |
+| `jle dst, src, label` | Jump to `label` if `dst <= src` (unsigned) |
+
+`dst` is always a register. `src` can be a register or an immediate.
+
+```asm
+jne r2, 8, bad_ix_data       # if r2 != 8 goto bad_ix_data
+jeq r4, 0x0, handler_a       # if r4 == 0 goto handler_a
+jgt r3, r6, deadline_missed  # if r3 > r6 (unsigned) goto deadline_missed
+```
+
+If the comparison is false, execution **falls through** to the next instruction. Falling through is the default; jumping is the exception.
+
+### Signed variants
+
+Prefix the unsigned mnemonics with `s`: `jsgt`, `jsge`, `jslt`, `jsle`. These exist because the bit pattern `0xffffffffffffffff` is `2^64 - 1` as unsigned (the largest possible) but `-1` as signed (one less than zero). Choosing the wrong comparison can produce a silent bug that only shows up at boundary values.
+
+Rule of thumb: use unsigned (`jgt`, etc.) for pointers, lengths, indices, and balances; use signed (`jsgt`, etc.) only when you know the value is a signed quantity that can actually be negative.
+
+### Unconditional jump: `ja`
+
+```asm
+ja label    # jump to label, no condition
+```
+
+Used at the end of a chain of `jeq`/`jne` to fall through to the error path, or to skip a block of instructions.
+
+## Family 4: syscalls and exit
+
+### `call <name>`
+
+Invokes a runtime-provided syscall by name. Arguments are placed in `r1` through `r5` before the call; the return value comes back in `r0`. Registers `r6` through `r9` are preserved; `r1` through `r5` should be assumed clobbered.
+
+```asm
+mov64 r1, r10
+sub64 r1, 40
+call sol_get_clock_sysvar
+; r0 = syscall return (0 on success)
+; r1-r5 are now garbage from our perspective
+```
+
+The names of available syscalls (`sol_log_`, `sol_get_clock_sysvar`, `sol_invoke_signed_c`, `sol_create_program_address`, `sol_memcmp_`, `sol_memcpy_`, and a handful of others) are resolved by the assembler against a known table; you do not need to import or declare them.
+
+### `exit`
+
+End program execution. Takes no operands. The runtime reads `r0` and treats its value as the program's exit code. `r0 = 0` is success; anything else is a failure that aborts the entire transaction.
+
+```asm
+mov64 r0, 0
+exit
+```
+
+There is no implicit `exit`. If execution flows past the last instruction in your program, the runtime traps with an out-of-bounds error. Every path through your program must end in an explicit `exit`.
+
+## Instruction summary
+
+| Mnemonic | Family | Purpose |
+|---|---|---|
+| `mov64`, `lddw` | data | set a register to a value or address |
+| `ldxb`, `ldxh`, `ldxw`, `ldxdw` | data | read from memory |
+| `stxb`, `stxh`, `stxw`, `stxdw` | data | write to memory |
+| `add64`, `sub64`, `mul64`, `div64`, `sdiv64` | arithmetic | integer math |
+| `and64`, `or64`, `xor64`, `lsh64`, `rsh64`, `arsh64` | arithmetic | bitwise |
+| `jeq`, `jne`, `jgt`, `jge`, `jlt`, `jle` (and `s` variants) | control flow | conditional jumps |
+| `ja` | control flow | unconditional jump |
+| `call` | syscall | invoke a runtime-provided syscall |
+| `exit` | control flow | end program, return `r0` |
+
+That is the entire vocabulary. Every program in this book is built from this set.
+
+## What to read next
+
+The final assembly chapter, [Stack and Syscalls](/docs/assembly/stack-and-syscalls), shows how the building blocks above combine into the two patterns you reach for constantly: allocating short-lived structures on the stack, and invoking syscalls while preserving values across the call.

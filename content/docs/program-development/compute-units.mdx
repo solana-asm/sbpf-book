@@ -1,0 +1,83 @@
+---
+title: Compute Unit Costs
+description: Per-instruction and per-syscall CU costs. Useful for budgeting and benchmarking.
+---
+
+Solana programs run under a per-transaction compute budget (default 200,000 CU, max 1,400,000 CU). This page lists what each instruction and syscall costs, so you can budget a program on paper before benchmarking.
+
+All numbers are approximate and may change between runtime versions. Benchmark with `quasar-svm` (or `solana-test-validator` + the SDK) on your actual code.
+
+## Per-instruction cost
+
+Almost every sBPF instruction costs **1 CU**:
+
+| Instruction family | CU |
+|---|---:|
+| `mov64`, `lddw` | 1 |
+| `ldxb`, `ldxh`, `ldxw`, `ldxdw` | 1 |
+| `stxb`, `stxh`, `stxw`, `stxdw` | 1 |
+| `add64`, `sub64`, `mul64`, `div64`, `sdiv64`, `mod64` | 1 |
+| `and64`, `or64`, `xor64`, `lsh64`, `rsh64`, `arsh64`, `neg64` | 1 |
+| `jeq`, `jne`, `jgt`, `jge`, `jlt`, `jle` (and `s` variants) | 1 |
+| `ja` | 1 |
+| `exit` | 0 (terminates execution) |
+
+A program of N instructions runs in approximately N CU, plus the cost of any syscalls.
+
+## Per-syscall cost (selected)
+
+| Syscall | Approximate CU | Notes |
+|---|---:|---|
+| `sol_log_` | 100 + 1 per byte | A 15-byte log is ~115 CU |
+| `sol_log_64_` | ~100 | Fixed cost regardless of values |
+| `sol_get_clock_sysvar` | ~140 | 100 base + 40 for the struct |
+| `sol_get_rent_sysvar` | ~117 | 100 base + 17 |
+| `sol_get_epoch_schedule_sysvar` | ~133 | |
+| `sol_get_epoch_rewards_sysvar` | ~116 | |
+| `sol_memcmp_` | ~10 + 1 per 8 bytes | |
+| `sol_memcpy_` | ~10 + 1 per 8 bytes | |
+| `sol_memset_` | ~10 + 1 per 8 bytes | |
+| `sol_create_program_address` | ~1500 | |
+| `sol_try_find_program_address` | ~1500 per bump tried | Up to ~256 bumps; avoid on-chain |
+| `sol_invoke_signed_c` | ~1000 base + callee's CU | A System Program transfer via CPI is ~1500 total |
+| `sol_sha256` | ~85 + 0.5 per byte | |
+| `sol_keccak256` | ~85 + 0.5 per byte | |
+| `sol_secp256k1_recover` | ~25000 | |
+
+## Compute budget defaults
+
+| Limit | Default | Maximum |
+|---|---:|---:|
+| Per instruction | 200,000 CU | 1,400,000 CU |
+| Per transaction | 200,000 CU | 1,400,000 CU |
+| Heap size | 32 KB | 256 KB |
+
+Increase via `ComputeBudgetInstruction` in the transaction:
+
+```ts
+ComputeBudgetProgram.setComputeUnitLimit({ units: 400_000 })
+ComputeBudgetProgram.setComputeUnitPrice({ microLamports: 1 })   // priority fee
+```
+
+## Real-world CU budgets
+
+For perspective:
+
+| Program | Approximate CU |
+|---|---:|
+| `sbpf-asm-noop` (1 instruction) | ~1 |
+| Hello, Solana! (4 instructions + sol_log_) | ~115 |
+| `slot_deadline` (12 instructions + sol_get_clock_sysvar) | ~152 |
+| `p-token` transfer (hand-optimised Pinocchio) | ~155 |
+| SPL Token transfer (Rust) | ~4,645 |
+| Anchor counter increment | ~200-300 |
+
+Pure-asm programs typically land in the 100-300 CU range for non-CPI work. Programs that do a CPI add at least 1000 CU for the syscall overhead plus the callee's cost.
+
+## Optimisation rules of thumb
+
+1. **Syscalls dominate.** Trim them before trimming instructions. One avoided `sol_log_` saves more CU than 50 mov instructions.
+2. **Avoid `sol_try_find_program_address` on-chain.** Pass the canonical bump in instruction data; verify with `sol_create_program_address`.
+3. **Pass sysvar accounts instead of calling `sol_get_*_sysvar`** when you can. Reading from an account at a known offset is ~5 CU vs `~140 CU` for the syscall.
+4. **Cache the validated input pointer in `r7`** (or another callee-saved register) so you don't need to re-derive it after syscalls.
+5. **Measure, do not guess.** Use `solana-test-validator` logs to read `consumed N of M compute units` after every change.

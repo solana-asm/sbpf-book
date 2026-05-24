@@ -1,0 +1,217 @@
+---
+title: Deploying
+description: Take a working program from localhost to devnet to mainnet. Covers funding, upgrade authority, upgrades, and reclaiming rent.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+
+The Quickstart deploys to a local validator. That's the right place to iterate. Once the program does what you want, you graduate it through devnet (a free, public test cluster) and eventually to mainnet (real users, real SOL).
+
+This chapter is the end-to-end path. By the time you finish it you will have: a program live on devnet, a known program ID you control, an upgrade flow, and a way to reclaim the rent if you ever want to retire the program.
+
+## The clusters
+
+| Cluster | Default RPC URL | SOL cost | Use for |
+|---|---|---|---|
+| Localhost | `http://127.0.0.1:8899` | none (fake SOL) | iteration, tests, CI |
+| Devnet | `https://api.devnet.solana.com` | none (airdroppable) | integration tests, public demos |
+| Mainnet | `https://api.mainnet-beta.solana.com` | real | production |
+
+You will spend most of your time on localhost. Devnet for end-to-end smoke tests with real network conditions. Mainnet only after you trust the program.
+
+## Funding the deployer
+
+Every cluster needs a funded keypair to pay for deployment. The Solana CLI uses one keypair globally, configured via `solana config get`. We will not change that here; we will just make sure each cluster's keypair has enough SOL.
+
+<Steps>
+<Step>
+
+### Devnet airdrop
+
+```shell title="Terminal"
+solana config set --url https://api.devnet.solana.com
+solana airdrop 2
+solana balance
+```
+
+`solana airdrop` is rate-limited (currently 5 SOL per hour per IP). If you hit the limit, use the [web faucet](https://faucet.solana.com).
+
+Deploying a ~1 KB program costs roughly 0.022 SOL of rent + ~0.001 SOL of transaction fees. Two devnet SOL covers many deploys.
+
+</Step>
+<Step>
+
+### Mainnet funding
+
+```shell title="Terminal"
+solana config set --url https://api.mainnet-beta.solana.com
+solana address
+```
+
+Transfer real SOL to the printed address from any wallet. Budget 0.05-0.1 SOL for one deploy of a small program (covers rent, headroom for upgrades, and transaction fees).
+
+</Step>
+</Steps>
+
+## Deploying to devnet
+
+The wrapper command:
+
+```shell title="Terminal"
+sbpf deploy <program-name> https://api.devnet.solana.com
+```
+
+This shells out to `solana program deploy ./deploy/<program-name>.so --program-id ./deploy/<program-name>-keypair.json --url <url>`. The deployer keypair comes from your active `solana config`.
+
+You should see output like:
+
+```
+🔄 Deploying "counter"
+Program Id: 5xJ8K... (44-character base58)
+Signature:  4P3rch... (88-character base58)
+✅ "counter" deployed successfully!
+```
+
+The **program ID** is the public key from your `deploy/<program-name>-keypair.json` file. It's deterministic: the same keypair always produces the same program ID, on every cluster. This is why you should reuse `deploy/<program-name>-keypair.json` across clusters instead of regenerating it.
+
+### Verify on Solscan
+
+```
+https://solscan.io/account/<PROGRAM_ID>?cluster=devnet
+```
+
+You should see your program account with `executable: true`, the BPF Loader (`BPFLoaderUpgradeab1e11111111111111111111111111111`) as the owner, and a recent transaction history.
+
+## Deploying to mainnet
+
+`sbpf deploy <name> https://api.mainnet-beta.solana.com` works the same way. Three additional precautions:
+
+<Steps>
+<Step>
+
+### Test on devnet first
+
+The exact bytes you'll deploy to mainnet should have been live on devnet for at least a few transactions. Catching a bug on devnet costs nothing; catching it on mainnet costs a redeploy plus reputation.
+
+</Step>
+<Step>
+
+### Use a fresh keypair for the deployer
+
+Do not deploy mainnet programs from your hot daily-driver keypair. Generate a separate deployer:
+
+```shell title="Terminal"
+solana-keygen new --outfile ~/.config/solana/mainnet-deployer.json
+solana config set --keypair ~/.config/solana/mainnet-deployer.json
+```
+
+Fund just this keypair. If it's ever compromised the blast radius is one deploy authority, not your whole portfolio.
+
+</Step>
+<Step>
+
+### Set the upgrade authority explicitly
+
+By default the deployer also becomes the upgrade authority (the only key that can later replace the program's bytecode). For mainnet, you almost always want the upgrade authority on a hardware wallet:
+
+```shell title="Terminal"
+solana program deploy deploy/<name>.so \
+  --program-id deploy/<name>-keypair.json \
+  --upgrade-authority usb://ledger \
+  --url https://api.mainnet-beta.solana.com
+```
+
+This uses the underlying `solana program deploy` rather than the `sbpf deploy` wrapper because the wrapper does not expose `--upgrade-authority`.
+
+To make a program immutable (no future upgrades possible), pass `--final` instead. This is irreversible.
+
+</Step>
+</Steps>
+
+## Upgrading a deployed program
+
+Once a program is deployed, redeploying with the same program-keypair *upgrades* it. The bytes change; the program ID and all the accounts it owns stay the same. Downstream callers don't need to update anything.
+
+```shell title="Terminal"
+sbpf build
+sbpf deploy <name> https://api.devnet.solana.com   # same as initial deploy
+```
+
+The runtime detects that a program already exists at that ID and atomically swaps the bytecode. The upgrade authority (your default keypair, or the explicit one you set with `--upgrade-authority`) must sign.
+
+<Callout type="warn">
+  Upgrades replace the entire program. If your new version has a different account layout for an account it owns, you must migrate existing accounts (or break them). Upgrade compatibility is your responsibility, not the runtime's.
+</Callout>
+
+### Inspecting an existing deployment
+
+```shell title="Terminal"
+solana program show <PROGRAM_ID> --url <cluster>
+```
+
+Tells you the program size, the upgrade authority, the balance, the last deploy slot.
+
+## Reclaiming rent (closing a program)
+
+If you want to retire a program and recover the rent SOL, close it:
+
+```shell title="Terminal"
+solana program close <PROGRAM_ID> \
+  --recipient <YOUR_WALLET> \
+  --bypass-warning \
+  --url <cluster>
+```
+
+The recipient receives whatever lamports the program account held (typically ~0.022 SOL for a ~1 KB program).
+
+<Callout type="warn">
+  **Closing is irreversible.** Once closed, the program ID is permanently unusable. Redeploying the same keypair to the same cluster will fail. Save your `deploy/<name>-keypair.json` and use a different one for any future deploys at the same address.
+
+  Close on devnet freely. Think hard before closing on mainnet.
+</Callout>
+
+## Cost summary
+
+| Action | Localhost | Devnet | Mainnet |
+|---|---|---|---|
+| Initial deploy (~1 KB program) | 0 | ~0.022 SOL airdropped | ~0.022 SOL real |
+| Per-transaction fee | 0 | ~5,000 lamports | ~5,000 lamports |
+| Upgrade | 0 | same as initial deploy | same as initial deploy |
+| Close & reclaim rent | n/a | refunds ~0.022 SOL | refunds ~0.022 SOL |
+
+## A typical lifecycle
+
+A small program from first deploy to mainnet, in commands:
+
+```shell title="Terminal"
+# 1. iterate on localhost
+solana-test-validator                                        # leave running
+solana config set --url localhost
+sbpf build
+sbpf deploy counter
+bun run test
+
+# 2. graduate to devnet
+solana config set --url https://api.devnet.solana.com
+solana airdrop 2
+sbpf deploy counter https://api.devnet.solana.com
+solana program show <PROGRAM_ID> --url devnet
+
+# 3. iterate and upgrade
+# (make changes, sbpf build, sbpf deploy again to upgrade)
+
+# 4. final deploy to mainnet
+solana config set --url https://api.mainnet-beta.solana.com
+solana program deploy deploy/counter.so \
+  --program-id deploy/counter-keypair.json \
+  --upgrade-authority usb://ledger \
+  --url https://api.mainnet-beta.solana.com
+```
+
+After step 4, your program ID is live on mainnet. Update any client code (see [Writing a Client](/docs/basics/client)) to point at the mainnet RPC and the same program ID.
+
+## What to read next
+
+This is the end of Basics. You have everything needed to write, deploy, and call sBPF programs. The [Reference](/docs/program-development/input-region) section is your lookup material for byte layouts, syscall signatures, CU costs, and the security-pitfalls audit checklist. The [Example Programs](/docs/program-development/example-programs) page is your reading list of complete programs that demonstrate patterns this book doesn't walk through individually.

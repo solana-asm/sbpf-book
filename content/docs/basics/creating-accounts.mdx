@@ -1,0 +1,305 @@
+---
+title: Creating Accounts
+description: The init handler walkthrough. CreateAccount via CPI with PDA signing.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+Accounts on Solana don't exist until something creates them. For accounts your program will own (a counter, a vault, an escrow), you create them via a CPI into the System Program's `CreateAccount` instruction. If the account is a PDA, your program signs for it using the seeds that derived the address.
+
+This chapter walks through that init pattern end to end. The next chapter ([A Complete Walkthrough](/docs/basics/walkthrough)) builds the matching increment handler against the account this chapter creates; together they form a complete two-handler counter program.
+
+This is the most complex single thing a program does. It combines everything from the previous chapters: PDAs, CPI, signer seeds, rent computation. The pattern is the same template every program-that-owns-accounts uses, including the canonical [`sbpf-asm-counter`](/docs/program-development/example-programs).
+
+## What the init handler must do
+
+The counter program owns a PDA derived from `["counter", owner.key, bump]`. For that PDA to hold data, it has to exist as an on-chain account. Accounts are created via a CPI to the System Program's `CreateAccount` instruction, which:
+
+1. Takes 16 bytes of lamports from the funder (the rent).
+2. Allocates a new account with a given byte size.
+3. Sets the new account's owner to the program ID you pass in.
+
+The new account itself must "sign" the create call. For a PDA, this means the program signs *as* the PDA, by including the seeds + bump in the CPI's signer-seeds array. The runtime re-derives the PDA from those seeds and treats it as a signer for the duration of the CPI.
+
+## The discriminator we'll use
+
+In the Walkthrough we used `0x1` for increment. We'll use `0x0` for init.
+
+```asm
+ldxb r4, [r7 + INSTRUCTION_DATA + 0]
+jeq r4, 0x0, handler_init
+jeq r4, 0x1, handler_increment
+ja bad_ix_data
+```
+
+## The account layout
+
+The init handler takes the same accounts as the Walkthrough plus the System Program:
+
+| Slot | Account | Flags | Purpose |
+|---:|---|---|---|
+| 0 | Owner | signer, writable | Pays rent, derives the PDA |
+| 1 | Counter PDA | writable | The account being created |
+| 2 | System Program | executable | Destination of the CPI |
+
+Three accounts means the `INSTRUCTION_DATA_LEN` offset shifts: `0x0008 + 3 × 0x2860 = 0x7928`.
+
+## The constants block
+
+```asm
+.equ NUM_ACCOUNTS,          0x0000
+
+# account 0: owner (signer, writable, pays rent)
+.equ OWNER_HEADER,          0x0008
+.equ OWNER_KEY,             0x0010
+.equ OWNER_LAMPORTS,        0x0050
+
+# account 1: counter PDA being created (writable)
+.equ COUNTER_HEADER,        0x2868
+.equ COUNTER_KEY,           0x2870
+
+# account 2: System Program (executable)
+.equ SYSTEM_PROGRAM_HEADER, 0x50c8
+.equ SYSTEM_PROGRAM_KEY,    0x50d0
+
+# instruction data: 2 bytes (discriminator + bump)
+.equ INSTRUCTION_DATA_LEN,  0x7928
+.equ INSTRUCTION_DATA,      0x7930
+.equ PROGRAM_ID,            0x7932
+
+# our counter account holds 16 bytes (1 bump + 7 padding + 8 counter u64)
+.equ COUNTER_SIZE,          16
+```
+
+## Step 1: validate and read the bump
+
+```asm
+handler_init:
+  # owner must be signer (will pay rent)
+  ldxb r2, [r7 + OWNER_HEADER + 1]
+  jeq r2, 0, bad_signer
+
+  # park the bump byte for use in seeds
+  ldxb r6, [r7 + INSTRUCTION_DATA + 1]
+```
+
+`r6` holds the bump for the rest of the handler. It survives the syscalls coming up.
+
+## Step 2: compute the required lamports (rent)
+
+The System Program's `CreateAccount` instruction takes a lamport amount that the new account will start with. For the account to be rent-exempt (the runtime won't ever charge it ongoing rent), this amount must be at least the rent-exemption threshold for its size.
+
+```asm
+  # read the rent sysvar into a 24-byte buffer (Rent struct is 17 bytes; round to 24)
+  mov64 r1, r10
+  sub64 r1, 24
+  call sol_get_rent_sysvar
+
+  # rent.lamports_per_byte_year is the first u64
+  mov64 r2, r10
+  sub64 r2, 24
+  ldxdw r3, [r2 + 0]
+
+  # required lamports = (128 + ACCOUNT_SIZE) × lamports_per_byte_year × 2
+  #
+  # 128 is ACCOUNT_STORAGE_OVERHEAD (rent applies as if every account has this much overhead).
+  # × 2 is DEFAULT_RENT_EXEMPTION_THRESHOLD: an account paying 2 years upfront is rent-exempt.
+  lddw r4, 128
+  add64 r4, COUNTER_SIZE
+  mul64 r4, r3
+  mul64 r4, 2
+```
+
+After this, `r4` holds the lamport amount the new account needs. Park it somewhere callee-saved before the next syscall would clobber it:
+
+```asm
+  mov64 r8, r4    # park rent amount in r8
+```
+
+## Step 3: build the seeds for PDA signing
+
+The signer-seeds array has the same `SolBytes` shape as `sol_create_program_address`, wrapped in one more layer: a `SolSignerSeeds` is itself an array of `SolBytes` (the seeds for one PDA), and you pass an array of `SolSignerSeeds` for multiple signers. We only have one signer (the counter PDA), so we pass an array of length 1 containing one `SolBytes[3]`.
+
+```asm
+  # 1. bump byte on its own stack slot
+  mov64 r9, r10
+  sub64 r9, 8
+  stxdw [r9 + 0], r6
+
+  # 2. SolBytes[3] for the three seeds: "counter", owner_key, bump
+  mov64 r5, r9
+  sub64 r5, 48
+
+  lddw  r3, seed_counter
+  stxdw [r5 + 0], r3
+  lddw  r3, 7
+  stxdw [r5 + 8], r3
+
+  mov64 r3, r7
+  add64 r3, OWNER_KEY
+  stxdw [r5 + 16], r3
+  lddw  r3, 32
+  stxdw [r5 + 24], r3
+
+  stxdw [r5 + 32], r9
+  lddw  r3, 1
+  stxdw [r5 + 40], r3
+
+  # 3. SolSignerSeeds wrapper (one entry pointing at the SolBytes array)
+  mov64 r6, r5
+  sub64 r6, 16
+  stxdw [r6 + 0], r5     # ptr to SolBytes array
+  lddw  r3, 3
+  stxdw [r6 + 8], r3     # number of seeds
+```
+
+`r6` now points to a `SolSignerSeeds[1]` array (16 bytes), which is what `sol_invoke_signed_c`'s fourth argument expects.
+
+## Step 4: build the CreateAccount instruction data
+
+The System Program's instruction data for CreateAccount:
+
+```
+[u32 discriminator (= 0)] [u64 lamports] [u64 space] [Pubkey owner]
+```
+
+Total 52 bytes. We allocate 56 for alignment.
+
+```asm
+  mov64 r4, r6
+  sub64 r4, 56
+
+  mov64 r2, r4
+  lddw  r3, 0
+  stxw  [r2 + 0], r3              # discriminator: 0 = CreateAccount
+  stxdw [r2 + 4], r8              # lamports (from rent calculation in r8)
+  lddw  r3, COUNTER_SIZE
+  stxdw [r2 + 12], r3             # space
+
+  # copy program ID (32 bytes) into [r4 + 20..52]
+  mov64 r1, r4
+  add64 r1, 20
+  mov64 r2, r7
+  add64 r2, PROGRAM_ID
+  lddw  r3, 32
+  call sol_memcpy_
+```
+
+The new account's owner is set to your program ID (read from the input region). This is what makes the account *yours* to read and write from this point forward.
+
+## Step 5: build the AccountMeta array (2 entries)
+
+```asm
+  mov64 r9, r4
+  sub64 r9, 32
+
+  # entry 0: owner (writable, signer, pays rent)
+  mov64 r2, r9
+  mov64 r3, r7
+  add64 r3, OWNER_KEY
+  stxdw [r2 + 0], r3              # pubkey ptr
+  ldxb  r3, [r7 + OWNER_HEADER + 2]
+  stxb  [r2 + 8], r3              # is_writable
+  ldxb  r3, [r7 + OWNER_HEADER + 1]
+  stxb  [r2 + 9], r3              # is_signer
+
+  # entry 1: counter PDA (writable, is_signer = 1 because the CPI signs for it)
+  add64 r2, 16
+  mov64 r3, r7
+  add64 r3, COUNTER_KEY
+  stxdw [r2 + 0], r3
+  ldxb  r3, [r7 + COUNTER_HEADER + 2]
+  stxb  [r2 + 8], r3
+  lddw  r3, 1                     # is_signer = 1 (PDA-signed)
+  stxb  [r2 + 9], r3
+```
+
+Note the `is_signer = 1` on the counter PDA entry. We are not a signer in the *input* region (the user didn't sign as the PDA, because they can't — there's no private key). We claim signer status here because the CPI will sign for the PDA using our signer-seeds array. The runtime cross-checks: if the seeds don't derive to the claimed PDA, the CPI rejects.
+
+## Step 6: build the Instruction struct (40 bytes)
+
+```asm
+  mov64 r2, r9
+  sub64 r2, 40                    # r2 = Instruction struct slot
+
+  mov64 r3, r7
+  add64 r3, SYSTEM_PROGRAM_KEY
+  stxdw [r2 + 0], r3              # program_id ptr
+  stxdw [r2 + 8], r9              # accounts (AccountMeta array)
+  lddw  r3, 2
+  stxdw [r2 + 16], r3             # accounts_len
+  stxdw [r2 + 24], r4             # data ptr (the CreateAccount data we built)
+  lddw  r3, 52
+  stxdw [r2 + 32], r3             # data_len
+```
+
+`r2` now holds the Instruction struct pointer. Park it in `r7`-equivalent before we build the AccountInfo array? No, `r2` is caller-saved and we'll use it before the next syscall; we can keep it.
+
+## Step 7: build the AccountInfo array (2 entries, 112 bytes)
+
+This is the most verbose part. Same pattern as the [CPI chapter](/docs/basics/cpi). Owner and Counter PDA each get a 56-byte entry mirroring their input-region fields.
+
+```asm
+  mov64 r3, r2
+  sub64 r3, 112
+
+  # entry 0: owner (full 56-byte AccountInfo)
+  mov64 r1, r3
+  mov64 r5, r7
+  add64 r5, OWNER_KEY
+  stxdw [r1 + 0], r5
+  mov64 r5, r7
+  add64 r5, OWNER_LAMPORTS
+  stxdw [r1 + 8], r5
+  # ... data_len, data_ptr, owner_ptr, rent_epoch, flags ...
+  # (omitted for brevity; the full pattern is in the CPI chapter)
+
+  # entry 1: counter PDA, same shape
+  add64 r1, 56
+  # ... full 56-byte entry ...
+```
+
+For the full byte-by-byte AccountInfo layout, see the [CPI chapter](/docs/basics/cpi#step-4-accountinfo-array-2-entries-56-bytes-112-bytes-total) or the disassembly of `sbpf-asm-counter` directly.
+
+## Step 8: fire the CPI
+
+```asm
+  mov64 r1, r2                    # Instruction struct
+  mov64 r2, r3                    # AccountInfo array
+  lddw  r3, 2                     # number of accounts
+  mov64 r4, r6                    # signer seeds (the SolSignerSeeds[1])
+  lddw  r5, 1                     # number of PDAs we're signing for
+  call sol_invoke_signed_c
+```
+
+`r0` is `0` if the System Program's CreateAccount succeeded. The counter PDA now exists, with `COUNTER_SIZE` bytes of zeroed data, owned by your program.
+
+## Step 9: initialise the data
+
+The new account's data is all zeros. The bump byte we want to store is in our `INSTRUCTION_DATA + 1` slot; the counter starts at zero (which is what zero-initialised memory already has). Write just the bump:
+
+```asm
+  ldxb r2, [r7 + INSTRUCTION_DATA + 1]
+  stxb [r7 + COUNTER_HEADER + 0x58 + 0], r2   # data[0] = bump
+
+  mov64 r0, 0
+  exit
+```
+
+Note the offset: `COUNTER_HEADER + 0x58` is the start of the account's data section (the `+0x58` is the constant offset of data within any account block).
+
+## Why the canonical example is worth reading
+
+[`sbpf-asm-counter`](/docs/program-development/example-programs) implements this exact pattern in roughly 200 lines (with a shared prelude between init and increment). Reading the actual file alongside this chapter is the fastest way to see how the CPI structures lay out in real source order. Pay particular attention to:
+
+- How the shared prelude derives and validates the PDA *for both handlers* before branching.
+- How the SolBytes seeds array is reused for `sol_create_program_address` (validation) and `sol_invoke_signed_c` (signing).
+- How rent is computed once and cached across the rest of the handler.
+
+## What changes if you don't use a PDA
+
+If you're creating a regular account (not a PDA), the caller passes a fresh keypair and signs the transaction with it. Your program then doesn't need the signer-seeds array; pass `0` for `signer_seeds` and `0` for `signer_seeds_len` in the `sol_invoke_signed_c` call. See [`create-account`](/docs/program-development/example-programs) in the program-examples repo for that simpler pattern.
+
+## What to read next
+
+You now have the init handler. The next chapter, [A Complete Walkthrough](/docs/basics/walkthrough), builds the matching increment handler and shows the two assembled into one program ready to deploy.

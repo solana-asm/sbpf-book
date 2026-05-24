@@ -1,0 +1,268 @@
+---
+title: CPI
+description: Cross-Program Invocation. The four-structure stack layout and the one syscall that ties them together.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+A Cross-Program Invocation (CPI) is one Solana program calling another. Your program builds an instruction destined for some other program, hands the runtime references to the accounts that instruction will touch, and the runtime executes that program within the current transaction. Any state changes the callee makes count toward the caller's transaction.
+
+This chapter covers the four stack-allocated structures you build before the call and the single syscall that fires it. Read the canonical `sbpf-asm-vault` example alongside this; the two together are the fastest way to internalize the pattern.
+
+## What you're building
+
+The runtime's CPI helper expects four things in memory:
+
+1. **An `Instruction` struct.** 40 bytes: program ID pointer (8), accounts pointer (8), accounts length (8), data pointer (8), data length (8).
+2. **An `AccountMeta` array.** Per account: 8-byte pubkey pointer, 1-byte writable flag, 1-byte signer flag, 6 bytes padding to align the next entry. Total 16 bytes per entry.
+3. **An `AccountInfo` array.** Per account: pubkey ptr (8), lamports ptr (8), data_len value (8), data ptr (8), owner ptr (8), rent_epoch value (8), is_signer (1), is_writable (1), is_executable (1), 5 bytes padding. Total 56 bytes per entry.
+4. **A signer seeds array.** Optional; only needed when signing with a PDA. Same shape as the seeds you pass to `sol_create_program_address`.
+
+You build these on the stack, descending from `r10`. Each structure lives below the one before it.
+
+## The syscall
+
+```
+sol_invoke_signed_c(
+  instruction:        *const Instruction,
+  account_infos:      *const AccountInfo[],
+  account_infos_len:  u64,
+  signer_seeds:       *const SolSignerSeeds[],
+  signer_seeds_len:   u64
+)
+```
+
+Returns `0` in `r0` on success, non-zero on failure (which itself aborts your program unless you handle it). Five arguments in `r1`–`r5`.
+
+For an unsigned CPI (the destination doesn't need a PDA signer), pass `0` for both `signer_seeds` and `signer_seeds_len`.
+
+## Worked example: System Program transfer
+
+The simplest CPI. Three accounts in our input region: source (signer, writable), destination (writable), and the System Program (executable). Instruction data is 8 bytes (a `u64` lamport amount). No PDA signing.
+
+The destination program ID is the System Program (`11111111111111111111111111111111`).
+
+The constants for this example:
+
+```asm title="constants for this chapter"
+.equ NUM_ACCOUNTS,         0x0000
+
+# account 0: source (signer, writable)
+.equ SOURCE_HEADER,        0x0008
+.equ SOURCE_KEY,           0x0010
+.equ SOURCE_OWNER,         0x0030
+.equ SOURCE_LAMPORTS,      0x0050
+.equ SOURCE_DATA_LEN,      0x0058
+.equ SOURCE_DATA,          0x0060
+.equ SOURCE_RENT_EPOCH,    0x2860
+
+# account 1: destination (writable)
+.equ DEST_HEADER,          0x2868
+.equ DEST_KEY,             0x2870
+.equ DEST_OWNER,           0x2890
+.equ DEST_LAMPORTS,        0x28b0
+.equ DEST_DATA_LEN,        0x28b8
+.equ DEST_DATA,            0x28c0
+.equ DEST_RENT_EPOCH,      0x50c0
+
+# account 2: System Program (executable)
+.equ SYSTEM_PROGRAM_HEADER, 0x50c8
+.equ SYSTEM_PROGRAM_KEY,    0x50d0
+
+# instruction data: 8 bytes (u64 lamport amount)
+.equ INSTRUCTION_DATA_LEN,  0x7938
+.equ INSTRUCTION_DATA,      0x7940
+```
+
+Body code below assumes `r1` is still the input pointer on entry (it's not saved into `r7` here because we don't make any syscalls between reading and using these offsets).
+
+### Step 1: AccountMeta array (2 entries, 32 bytes total)
+
+Source needs to be writable + signer. Destination needs to be writable.
+
+```asm
+# r9 points to start of AccountMeta array (we'll allocate 32 bytes here)
+mov64 r9, r10
+sub64 r9, 32
+
+# entry 0: source account (writable, signer)
+mov64 r2, r9
+mov64 r3, r1
+add64 r3, SOURCE_KEY                          # ptr to source pubkey
+stxdw [r2 + 0], r3
+ldxb r3, [r1 + SOURCE_HEADER + 2]             # is_writable
+stxb [r2 + 8], r3
+ldxb r3, [r1 + SOURCE_HEADER + 1]             # is_signer
+stxb [r2 + 9], r3
+
+# entry 1: dest account (writable, not signer)
+add64 r2, 16
+mov64 r3, r1
+add64 r3, DEST_KEY
+stxdw [r2 + 0], r3
+ldxb r3, [r1 + DEST_HEADER + 2]
+stxb [r2 + 8], r3
+ldxb r3, [r1 + DEST_HEADER + 1]
+stxb [r2 + 9], r3
+```
+
+### Step 2: Instruction data (12 bytes: discriminator + amount)
+
+The System Program's Transfer instruction expects a 4-byte discriminator followed by an 8-byte lamport amount. We round 12 up to 16 for stack alignment.
+
+```asm
+mov64 r8, r9
+sub64 r8, 16                                  # 16-byte slot (12 bytes used, 4 padding)
+
+mov64 r2, r8
+lddw  r3, 2                                   # discriminator: 2 = SystemInstruction::Transfer
+stxw  [r2 + 0], r3                            # 4 bytes
+ldxdw r3, [r1 + INSTRUCTION_DATA]             # amount comes from our caller's ix data (8 bytes)
+stxdw [r2 + 4], r3                            # 8 bytes
+```
+
+### Step 3: Instruction struct (40 bytes)
+
+```asm
+mov64 r7, r8
+sub64 r7, 40
+
+mov64 r2, r7
+mov64 r3, r1
+add64 r3, SYSTEM_PROGRAM_KEY                  # program ID = System Program pubkey
+stxdw [r2 + 0], r3
+mov64 r3, r9
+stxdw [r2 + 8], r3                            # accounts ptr
+lddw r3, 2
+stxdw [r2 + 16], r3                           # accounts len
+mov64 r3, r8
+stxdw [r2 + 24], r3                           # data ptr
+lddw r3, 12
+stxdw [r2 + 32], r3                           # data len
+```
+
+### Step 4: AccountInfo array (2 entries × 56 bytes = 112 bytes total)
+
+This is the most verbose part. Each entry mirrors all the fields the runtime gave you in the input region, but for the accounts you're handing to the CPI. The destination program reads from these AccountInfos exactly as your program reads from `r1` at entry.
+
+Each entry's layout is `pubkey_ptr (8) + lamports_ptr (8) + data_len (8) + data_ptr (8) + owner_ptr (8) + rent_epoch (8) + is_signer (1) + is_writable (1) + is_executable (1) + 5 bytes padding = 56`.
+
+```asm
+mov64 r6, r7
+sub64 r6, 112
+
+# --- entry 0: source ---
+mov64 r2, r6
+mov64 r3, r1
+add64 r3, SOURCE_KEY
+stxdw [r2 + 0], r3                            # pubkey ptr
+mov64 r3, r1
+add64 r3, SOURCE_LAMPORTS
+stxdw [r2 + 8], r3                            # lamports ptr
+ldxdw r3, [r1 + SOURCE_DATA_LEN]
+stxdw [r2 + 16], r3                           # data_len (value, not ptr)
+mov64 r3, r1
+add64 r3, SOURCE_DATA
+stxdw [r2 + 24], r3                           # data ptr
+mov64 r3, r1
+add64 r3, SOURCE_OWNER
+stxdw [r2 + 32], r3                           # owner ptr
+ldxdw r3, [r1 + SOURCE_RENT_EPOCH]
+stxdw [r2 + 40], r3                           # rent_epoch (value, not ptr)
+ldxb  r3, [r1 + SOURCE_HEADER + 1]
+stxb  [r2 + 48], r3                           # is_signer
+ldxb  r3, [r1 + SOURCE_HEADER + 2]
+stxb  [r2 + 49], r3                           # is_writable
+ldxb  r3, [r1 + SOURCE_HEADER + 3]
+stxb  [r2 + 50], r3                           # is_executable
+# bytes 51-55 are padding; they remain uninitialised (the runtime ignores them)
+
+# --- entry 1: dest ---
+add64 r2, 56                                  # advance r2 to the next 56-byte slot
+mov64 r3, r1
+add64 r3, DEST_KEY
+stxdw [r2 + 0], r3                            # pubkey ptr
+mov64 r3, r1
+add64 r3, DEST_LAMPORTS
+stxdw [r2 + 8], r3                            # lamports ptr
+ldxdw r3, [r1 + DEST_DATA_LEN]
+stxdw [r2 + 16], r3                           # data_len
+mov64 r3, r1
+add64 r3, DEST_DATA
+stxdw [r2 + 24], r3                           # data ptr
+mov64 r3, r1
+add64 r3, DEST_OWNER
+stxdw [r2 + 32], r3                           # owner ptr
+ldxdw r3, [r1 + DEST_RENT_EPOCH]
+stxdw [r2 + 40], r3                           # rent_epoch
+ldxb  r3, [r1 + DEST_HEADER + 1]
+stxb  [r2 + 48], r3                           # is_signer
+ldxb  r3, [r1 + DEST_HEADER + 2]
+stxb  [r2 + 49], r3                           # is_writable
+ldxb  r3, [r1 + DEST_HEADER + 3]
+stxb  [r2 + 50], r3                           # is_executable
+```
+
+After this, `r6` points to a 112-byte array of two AccountInfo entries.
+
+### Step 5: Fire the CPI
+
+```asm
+mov64 r1, r7                                  # Instruction struct
+mov64 r2, r6                                  # AccountInfo array
+lddw r3, 2                                    # account count
+lddw r4, 0                                    # no signer seeds
+lddw r5, 0                                    # no signer seeds count
+call sol_invoke_signed_c
+```
+
+The runtime executes the System Program's transfer instruction. Lamports move from source to destination. Your program continues at the instruction after `call`. If anything failed, `r0` is non-zero and the entire transaction aborts.
+
+## Signing as a PDA
+
+When the destination program requires a PDA as signer (e.g. a vault releasing funds), pass the same seeds array that `sol_create_program_address` accepts as `r4`, and the count as `r5`.
+
+```asm
+# r9 already holds a SolSignerSeeds array (3 entries: "vault", owner_key, bump)
+mov64 r1, r7
+mov64 r2, r6
+lddw r3, 2
+mov64 r4, r9                                  # signer seeds
+lddw r5, 1                                    # one PDA signer
+call sol_invoke_signed_c
+```
+
+The runtime re-derives the PDA from your seeds and treats it as a signer for the duration of the CPI. This is how programs spend lamports from accounts they own.
+
+## CU cost
+
+The CPI syscall itself charges about 1,000 CU base, plus the CU consumed by the destination program. A simple System Program transfer takes roughly 1,500 CU total when invoked via CPI.
+
+This is the most expensive thing your program can do. Build the CPI structures only when the upstream validation has passed; do not eagerly construct them and discard if a check fails.
+
+## A real-world template
+
+The canonical `sbpf-asm-vault` example builds two CPI calls (deposit and withdraw), one using PDA signing. Open it next to this chapter and trace the construction step by step. The four-structure layout is the same every time; only the field values change.
+
+The Anchor parallel:
+```rust
+let cpi_ctx = CpiContext::new_with_signer(
+  ctx.accounts.system_program.to_account_info(),
+  Transfer { from: ..., to: ... },
+  &[&[b"vault", owner.as_ref(), &[bump]]],
+);
+system_program::transfer(cpi_ctx, amount)?;
+```
+
+Anchor generates exactly the same four structures from this. You're writing by hand what the macros generate.
+
+## Common mistakes
+
+- **Forgetting padding.** AccountMeta entries are 16 bytes (32 + 1 + 1 + 6 padding). Writing only 10 bytes per entry packs the array wrong and the runtime reads garbage.
+- **Wrong account count.** `accounts_len` in the Instruction struct must match the number of `AccountInfo` entries you pass. Off-by-one and the runtime reads past the array.
+- **Stale signer/writable flags.** Copy `is_signer` and `is_writable` from the caller's account headers (your input region), not hardcoded constants. The runtime cross-checks; mismatches reject the CPI.
+- **PDA seeds in the wrong order.** Seeds must match the order used to derive the PDA originally. Swapping `owner_key` and `bump` makes the runtime derive a different address and the signer check fails.
+
+## What's next
+
+This is the end of Core Concepts. Subsequent sections build on this foundation: how to lay out a single-instruction guard program, how to compose programs in a transaction, and how to benchmark and optimize CU.

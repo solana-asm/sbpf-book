@@ -1,0 +1,27 @@
+---
+title: Introduction
+description: The sBPF Programming Book is a guide to writing Solana programs in pure assembly.
+---
+
+Every Solana program compiles down to **sBPF**, a deterministic 8-byte-instruction virtual machine derived from Berkeley Packet Filter. Anchor, Pinocchio, and native Rust are conveniences over the same target. This book teaches you to skip the conveniences when they cost too much.
+
+You reach for sBPF assembly when audit clarity, sub-kilobyte binaries, byte-exact compute budgets, or the absence of a Rust runtime tax outweigh the ergonomics of a higher-level framework.
+
+<Callout type="info">
+  If you already write Anchor (`#[derive(Accounts)]`, `#[account(mut)]`, `CpiContext::new`), this book maps each idiom to its sBPF equivalent. Same flow (validate inputs, mutate accounts, CPI), exposed at the layer the runtime actually sees.
+</Callout>
+
+## Where to start
+
+<Cards>
+  <Card
+    title="Installation"
+    href="/docs/installation"
+    description="Install Rust, the Solana CLI, and the sbpf toolchain. Configure shell completions. About ten minutes."
+  />
+  <Card
+    title="Quickstart"
+    href="/docs/quickstart"
+    description="Scaffold a project, build, deploy to a local validator, and disassemble. About five minutes once the toolchain is installed."
+  />
+</Cards>

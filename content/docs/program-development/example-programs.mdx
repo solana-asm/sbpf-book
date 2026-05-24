@@ -1,0 +1,26 @@
+---
+title: Example Programs
+description: Real sBPF programs to read alongside this book.
+---
+
+## Beginner
+
+From [`solana-developers/program-examples`](https://github.com/solana-developers/program-examples). Each lives at `basics/<name>/asm/` and ships alongside Native Rust, Anchor, Steel, and Poseidon implementations of the same problem.
+
+| Program | What it shows |
+|---|---|
+| [`hello-solana`](https://github.com/solana-developers/program-examples/tree/main/basics/hello-solana/asm) | Minimum viable program; `sol_log_`; `.rodata` |
+| [`checking-accounts`](https://github.com/solana-developers/program-examples/tree/main/basics/checking-accounts/asm) | Signer / writable / owner / pubkey validation |
+| [`create-account`](https://github.com/solana-developers/program-examples/tree/main/basics/create-account/asm) | CPI to `CreateAccount`, no PDA signing |
+| [`transfer-sol`](https://github.com/solana-developers/program-examples/tree/main/basics/transfer-sol/asm) | CPI to System Program `Transfer` |
+
+## Reference
+
+From [`blueshift-gg/sbpf`](https://github.com/blueshift-gg/sbpf) `examples/`.
+
+| Program | What it shows |
+|---|---|
+| [`sbpf-asm-cpi`](https://github.com/blueshift-gg/sbpf/tree/main/examples/sbpf-asm-cpi) | A CPI walkthrough with the four structures laid out explicitly |
+| [`sbpf-asm-counter`](https://github.com/blueshift-gg/sbpf/tree/main/examples/sbpf-asm-counter) | PDA + state + dispatch + account creation with PDA signing |
+| [`sbpf-asm-vault`](https://github.com/blueshift-gg/sbpf/tree/main/examples/sbpf-asm-vault) | SOL vault with PDA signing across deposit and withdraw |
+| [`sbpf-asm-escrow`](https://github.com/bidhan-a/sbpf-asm-escrow) (community) | SPL Token CPIs, multi-PDA state machine |

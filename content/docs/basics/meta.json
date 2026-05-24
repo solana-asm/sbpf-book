@@ -1,0 +1,14 @@
+{
+  "title": "Basics",
+  "pages": [
+    "program-structure",
+    "account-data",
+    "errors-and-logging",
+    "pdas",
+    "cpi",
+    "creating-accounts",
+    "walkthrough",
+    "client",
+    "deploying"
+  ]
+}

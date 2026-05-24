@@ -1,0 +1,74 @@
+---
+title: Contribution Guide
+description: How to propose changes to this book and to sBPF tooling.
+---
+
+This book is open source. Issues and pull requests are welcome whether you spotted a typo, want to add a chapter, or are improving the underlying `sbpf` tooling.
+
+## Issue guidelines
+
+Before opening an issue or PR, please follow these conventions. They exist to keep reviews focused and history clean.
+
+### Before coding
+
+- **Choose a branch name that describes the issue you're working on.** Something like `fix-cpi-accountinfo-layout`, not `patch-1`.
+- **Enable commit signing.** GPG or SSH-signed commits. The project's CI checks signatures on merged commits.
+
+### While coding
+
+- **Submit a draft PR as soon as you have something compiling.** This lets reviewers see the direction early and catches misunderstandings before you write 500 lines in the wrong direction.
+- **Only change code directly relevant to your PR.** You will inevitably find unrelated things that could use refactoring. Resist. File a separate issue. Mixed-purpose PRs are hard to review and almost always end up with one part being correct and the other being rejected, leaving both stuck.
+- **If you write comments, keep them under 80 characters per line.** This lets contributors working in narrow editor windows read them without horizontal scrolling.
+- **Write adversarial tests.** If you're adding a new account type, do not only write tests where the instruction succeeds. Also write tests where the instruction fails because a check inside the type was violated. The failure tests are usually where the real bugs hide.
+
+### After coding
+
+- **If you've moved code around, build the docs with `cargo doc --open`** (for the Rust crates) or `bun run build` (for this book) and adjust any broken links. Internal cross-links rot quickly.
+- **If you made a change to `sbpf`'s periphery** (the CLI or the assembler), file a corresponding PR or issue against this book if the change affects what a reader should be told.
+
+## Book contributions specifically
+
+For changes to this book (the `BOOK/` directory):
+
+- **One concept per PR.** A typo fix and a new chapter should not be in the same PR.
+- **Match the book's voice.** Lead with the why and the invariant. Define terms before using them. Don't use em-dashes (project convention). Use `#` for asm comments, not `;`. Use `SCREAMING_CASE` for `.equ` names and `snake_case` for labels.
+- **Run the typecheck before pushing**: `bun run types:check` from inside `BOOK/`. Broken MDX or TypeScript fails CI.
+- **Verify every code block compiles.** Every `.asm` block in a chapter should be valid sBPF that the assembler accepts. If you can, save it to a temporary `.s` file and run `sbpf build` against it.
+- **Update the relevant `meta.json`** if you add or remove a chapter. The sidebar reads from these files; an orphaned `.mdx` won't appear in navigation.
+
+## Reporting bugs in code examples
+
+If you find a code example in a chapter that does not assemble or that has a logic bug:
+
+1. Open an issue titled with the chapter name and a short summary: e.g. `basics/pdas: seed array uses r2 before it's set`.
+2. Quote the exact block from the chapter and explain what's wrong.
+3. Propose the fix in the issue body. If the fix is small, send a PR with the same content.
+
+## Reporting bugs in the `sbpf` toolchain
+
+Bugs in the assembler, the CLI, or the linker should be filed in [`blueshift-gg/sbpf`](https://github.com/blueshift-gg/sbpf) directly, not against this book. Include:
+
+- The exact `.s` source or command that reproduces the issue.
+- The output of `sbpf --version` and your operating system.
+- The expected behaviour and the observed behaviour.
+
+If a fix lands in `sbpf` that changes anything readers of this book should know about, also file a PR against the book to update the relevant chapter.
+
+## Style sheet
+
+Quick reference for prose conventions in this book:
+
+| Convention | Example |
+|---|---|
+| Asm comments | `# this is a comment`, not `; this is a comment` |
+| `.equ` names | `SCREAMING_CASE` |
+| Labels | `snake_case` |
+| Numbers in prose | "10336 bytes (`0x2860`)", not "10,336 bytes" |
+| Anchor references | Only when they clarify the asm equivalent, not as a default |
+| No em-dashes | Use commas, colons, parentheses, or sentence breaks |
+| Chapter headings | `##` for sections, `###` for subsections, `####` for sub-subsections |
+| Code blocks | Add `title="path/to/file.s"` when the block represents a complete file |
+
+## License
+
+This book is MIT-licensed. By contributing, you agree your changes are also MIT.

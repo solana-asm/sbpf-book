@@ -1,0 +1,211 @@
+---
+title: Stack and Syscalls
+description: How to allocate stack slots, how to call syscalls cleanly, and the patterns you reach for in every program.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+The previous two chapters described the static parts of sBPF: the registers and memory model, and the instructions you have available. This chapter is about the two patterns you will use most often once you start writing real programs. Both come up the moment you do anything beyond the trivial.
+
+## Allocating short-lived data on the stack
+
+The stack is your scratch space. You use it to hold:
+
+- A buffer the runtime is about to write into (e.g. the 40-byte `Clock` struct returned by `sol_get_clock_sysvar`).
+- A structure you are building to pass to a syscall (e.g. an `Instruction` struct for a CPI).
+- A short array of seeds for a PDA derivation.
+- Any intermediate value that does not fit in registers.
+
+The stack has no allocator and no garbage collector. You allocate by subtracting from `r10` into another register; you deallocate by simply not using that register any more.
+
+### The basic pattern
+
+```asm
+mov64 r9, r10      # r9 = top of stack
+sub64 r9, 40       # r9 = top - 40, a 40-byte slot
+```
+
+`r9` now points to a 40-byte region you have implicitly claimed. Read and write through `r9`:
+
+```asm
+stxdw [r9 + 0], r2     # write r2 to the first 8 bytes
+stxdw [r9 + 8], r3     # write r3 to the next 8 bytes
+ldxdw r4, [r9 + 0]     # read the first 8 bytes back
+```
+
+To allocate a second slot below the first, repeat the pattern:
+
+```asm
+mov64 r8, r9
+sub64 r8, 16       # r8 = r9 - 16, a 16-byte slot just below
+```
+
+The convention is to use `r9` for the first slot you allocate, `r8` for the next one below, then `r7`, then `r6`. This matches the order the canonical sbpf examples (`sbpf-asm-vault`, `sbpf-asm-counter`) follow.
+
+### Why not address `r10` directly?
+
+You cannot write to `r10`. The instruction set forbids it. The reason is safety: an accidental `r10 = whatever` would orphan the stack and any subsequent stack operation would land in undefined memory. Computing a working pointer into another register, then writing through that, sidesteps the problem entirely.
+
+A consequence: you cannot do `stxdw [r10 - 40], r2` directly even as a shorthand. You must compute the address into a register first. The asm above (`mov r9, r10; sub r9, 40; stxdw [r9 + 0], r2`) is the equivalent.
+
+### How much stack do you have?
+
+4 KB total. That sounds tight, and it is. Programs that invoke other programs (covered in [CPI](/docs/basics/cpi)) spend most of that allocating the structures the runtime expects. For a single call into the System Program with two accounts the structures total roughly 250-300 bytes. For a call with six accounts they can hit 800+. Plan accordingly: do not allocate more than you need and reuse slots when possible.
+
+### Alignment on the stack
+
+If you store an 8-byte value on the stack with `stxdw`, the address you store to must be 8-byte aligned. `r10` itself is 8-byte aligned on entry. So `r10 - 8`, `r10 - 16`, `r10 - 40` are all aligned. `r10 - 7` is not.
+
+The simplest rule: only subtract multiples of 8 from `r10` when allocating slots. If you need a smaller structure, round up to the next multiple of 8 and leave some bytes unused. The compute cost of wasted bytes is zero; the cost of a misaligned write is a trap.
+
+## Invoking syscalls
+
+A syscall does work the instruction set cannot: reads a sysvar, hashes data, calls another program. You invoke one with the `call` instruction, naming the syscall.
+
+### The mechanics
+
+1. Save anything you need past the call into `r6`-`r9`.
+2. Set up arguments in `r1` through `r5`.
+3. `call sol_xxx`.
+4. Read the return value from `r0`.
+5. Use `r6`-`r9` as needed; do not trust `r1`-`r5` to hold anything meaningful.
+
+### An end-to-end example
+
+Reading the current slot from the Clock sysvar:
+
+```asm title="read current slot"
+mov64 r1, r10
+sub64 r1, 40                        # r1 = address of a 40-byte stack buffer
+
+call sol_get_clock_sysvar           # writes 40 bytes into the buffer
+                                    # r0 = 0 on success
+                                    # r1-r5 are now garbage
+
+mov64 r2, r10
+sub64 r2, 40                        # recompute the buffer address into r2
+ldxdw r3, [r2 + 0]                  # r3 = first 8 bytes (Clock.slot, u64)
+```
+
+Three things to notice:
+
+1. **We re-compute the buffer address after the call.** `r1` no longer points where it did before the call. We do not trust it.
+2. **The syscall writes 40 bytes** because the `Clock` struct is 40 bytes (`slot`, `epoch_start_timestamp`, `epoch`, `leader_schedule_epoch`, `unix_timestamp`, all 8 bytes each).
+3. **We read only the field we care about**. `Clock.slot` is the first field, at offset 0 of the buffer.
+
+### Saving a value across a call
+
+If you have a value you need after a syscall, move it to one of `r6`-`r9` **before** the call.
+
+```asm title="park a value before syscall"
+mov64 r6, r2                        # save r2 into r6 (r6 survives the call)
+
+mov64 r1, r10
+sub64 r1, 40
+call sol_get_clock_sysvar           # r1-r5 clobbered, r6 preserved
+
+mov64 r2, r10
+sub64 r2, 40
+ldxdw r3, [r2 + 0]                  # r3 = current slot
+
+jgt r3, r6, deadline_missed         # compare current slot against our saved value
+```
+
+This is the structure of every program that combines a sysvar read with a comparison: park the value in a callee-saved register, do the syscall, compare.
+
+<Callout type="warn">
+  Forgetting to park a value before a syscall is the single most common bug. The symptom is mysterious: the program runs, no trap fires, but the comparison after the call uses garbage instead of the value you expected. Always think "what do I need after this call?" before the call.
+</Callout>
+
+### Syscall return values
+
+Every syscall returns a `u64` in `r0`. For most syscalls, `0` is success and non-zero is an error. The runtime's behaviour on error varies by syscall:
+
+- `sol_get_clock_sysvar`, `sol_get_rent_sysvar`, etc. (sysvar reads) always succeed; `r0 = 0`.
+- `sol_log_` writes a log line and returns; `r0` is not meaningful.
+- `sol_invoke_signed_c` returns 0 if the inner program succeeded, non-zero if it failed. If it failed, your transaction will abort regardless of what you do next; the runtime propagates the failure.
+- `sol_memcmp_` returns 0 always; the actual comparison result is written into a buffer pointed to by `r4`. (This is unusual; we'll cover it specifically when we use it.)
+
+Read the syscall's behaviour the first time you use it. It is almost never what you would guess.
+
+### Compute units consumed by syscalls
+
+Syscalls are expensive relative to instructions. Approximate costs (subject to runtime version):
+
+| Syscall | Cost (CU) |
+|---|---|
+| `sol_get_clock_sysvar` | ~140 (100 base + 40 for the struct size) |
+| `sol_get_rent_sysvar` | ~117 |
+| `sol_log_` (per call) | ~100 base + 1 per byte logged |
+| `sol_memcmp_` | depends on length |
+| `sol_invoke_signed_c` | ~1000 base + the inner program's cost |
+| `sol_create_program_address` | ~1500 |
+
+For comparison, a non-syscall instruction is 1 CU. A single `sol_get_clock_sysvar` costs the same as 140 mov instructions. This is why CU-conscious programs avoid syscalls when they can, or batch work to amortize the cost.
+
+## Common stack + syscall patterns
+
+You will see these combinations repeatedly through the rest of the book.
+
+### Pattern 1: read a caller-supplied value, then a sysvar, then compare
+
+Assume the caller-supplied value is a u64 living at some known offset in the input region (we'll cover what "the input region" means in the next section; for now treat `r1` as a pointer to a buffer the runtime handed us).
+
+```asm
+# park the caller's value into r6 (callee-saved across the syscall)
+ldxdw r6, [r1 + 0x10]               # arbitrary offset standing in for "field X"
+
+# read the sysvar we need
+mov64 r1, r10
+sub64 r1, 40
+call sol_get_clock_sysvar
+
+# read the slot from the buffer the sysvar wrote
+mov64 r2, r10
+sub64 r2, 40
+ldxdw r3, [r2 + 0]
+
+# compare
+jgt r3, r6, condition_failed
+```
+
+This is the shape of any program that compares a sysvar value against caller-supplied input. The Core Concepts section will cover the real offsets you read from `r1`.
+
+### Pattern 2: build a stack structure then pass to a syscall
+
+```asm
+# allocate a 16-byte struct (e.g. two u64 fields)
+mov64 r9, r10
+sub64 r9, 16
+mov64 r2, 42
+stxdw [r9 + 0], r2
+mov64 r2, 7
+stxdw [r9 + 8], r2
+
+# pass it to a syscall
+mov64 r1, r9
+mov64 r2, 16
+call sol_xxx
+```
+
+This is how every CPI is constructed: build the Instruction struct, the AccountMeta array, the AccountInfo array on the stack, then point the syscall at them.
+
+### Pattern 3: log and exit
+
+```asm
+condition_failed:
+  lddw r1, msg_failed
+  mov64 r2, 9
+  call sol_log_
+  mov64 r0, 1
+  exit
+
+.rodata
+  msg_failed: .ascii "condition"   # 9 bytes
+```
+
+Used at the bottom of every program to emit a human-readable error before failing the transaction. The string lives in `.rodata`; `lddw` loads its address; `r2` carries the byte length.
+
+## What to read next
+
+You now have the full assembly vocabulary: registers, memory, instructions, the stack, and syscalls. The next section, **Core Concepts**, applies these to the actual problem of writing a Solana program. The first chapter, [Program Structure](/docs/basics/program-structure), covers the runtime interface: what the input region holds, how to declare offsets, and how to dispatch on instruction discriminators.

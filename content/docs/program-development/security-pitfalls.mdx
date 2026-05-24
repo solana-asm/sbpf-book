@@ -1,0 +1,202 @@
+---
+title: Security Pitfalls
+description: Common asm-specific vulnerabilities and how to avoid them.
+---
+
+In Anchor, the framework checks the things this page lists for you. In assembly, you check them by hand. Forgetting any single one is a critical vulnerability.
+
+This page is the audit checklist. Every production program should pass every item.
+
+## 1. Missing signer check
+
+**Symptom**: an unsigned account performs a privileged operation.
+
+**Failure mode**: an attacker calls your program with a regular account in the "owner" slot (with `is_signer = 0`). Your program proceeds as if they signed, and credits the operation to a key they don't control.
+
+**Fix**:
+
+```asm
+ldxb r2, [r1 + OWNER_HEADER + 1]   # is_signer flag
+jeq r2, 0, not_signer              # refuse if not signed
+```
+
+**Anchor parallel**: `Signer<'info>` type wrapper.
+
+## 2. Missing owner check
+
+**Symptom**: a program accepts an account owned by an unrelated program as if it were its own.
+
+**Failure mode**: an attacker crafts an account owned by some other program with bytes that happen to match your expected layout. Your program reads those bytes as if they were your state and mutates them, corrupting unrelated state or being deceived by attacker-controlled data.
+
+**Fix**: compare the account's owner field against your expected owner (your program ID for accounts you own, the System Program ID for fresh accounts, etc.) using `sol_memcmp_`.
+
+```asm
+mov64 r4, r10
+sub64 r4, 4                        # 4-byte result buffer
+lddw  r1, expected_owner_bytes     # in .rodata
+mov64 r2, r7
+add64 r2, ACCT0_OWNER
+lddw  r3, 32
+call sol_memcmp_
+ldxw  r2, [r4 + 0]
+jne r2, 0, bad_owner
+```
+
+**Anchor parallel**: `#[account(owner = expected::ID)]`.
+
+## 3. Missing PDA verification
+
+**Symptom**: an attacker passes a regular (non-PDA) account at the "PDA" slot; your program treats it as a PDA-owned account.
+
+**Failure mode**: the program reads/writes the attacker's account, exposing privileged operations to an unauthorised key. This is the **most common critical bug** in PDA-using programs.
+
+**Fix**: after `sol_create_program_address` derives the address, compare it against the passed-in account's pubkey:
+
+```asm
+mov64 r4, r6
+sub64 r4, 4
+mov64 r1, r6                       # derived PDA
+mov64 r2, r7
+add64 r2, ACCT1_KEY                # passed-in pubkey
+lddw  r3, 32
+call sol_memcmp_
+ldxw  r2, [r4 + 0]
+jne r2, 0, bad_pda
+```
+
+**Anchor parallel**: `#[account(seeds = [...], bump)]`.
+
+## 4. Missing writable check
+
+**Symptom**: program writes to an account that wasn't marked writable; the runtime traps mid-execution.
+
+**Failure mode**: the program aborts mid-operation, leaving the caller without a clear error and burning gas. Not a vulnerability in the security sense, but a reliability bug.
+
+**Fix**:
+
+```asm
+ldxb r2, [r1 + ACCT1_HEADER + 2]   # is_writable
+jeq r2, 0, not_writable
+```
+
+**Anchor parallel**: `#[account(mut)]`.
+
+## 5. Missing instruction data length validation
+
+**Symptom**: program reads past the end of the instruction data buffer.
+
+**Failure mode**: depending on what comes after the buffer, this either returns garbage data (and the program continues with that garbage) or traps. Either is bad.
+
+**Fix**: validate length at the very top of `entrypoint`:
+
+```asm
+ldxdw r2, [r1 + INSTRUCTION_DATA_LEN]
+jne r2, EXPECTED_LEN, bad_ix_data
+```
+
+For variable-length data, use `jlt` against a minimum.
+
+## 6. Missing account count validation
+
+**Symptom**: program reads from offsets that assume a certain account count, but the caller passed fewer accounts. Reads land outside the input region.
+
+**Fix**:
+
+```asm
+ldxdw r2, [r1 + NUM_ACCOUNTS]
+jne r2, EXPECTED_COUNT, bad_accounts
+```
+
+Pair this with the `.equ` offsets, which are only valid for the assumed account count.
+
+## 7. Forgetting to set `r0` before `exit`
+
+**Symptom**: program exits with a non-deterministic status code.
+
+**Failure mode**: a code path that should return success (`r0 = 0`) actually returns whatever was left in `r0` from a previous instruction, possibly non-zero. Sometimes succeeds, sometimes fails, based on register state you never reasoned about.
+
+**Fix**: every label that ends in `exit` has a `mov64 r0, <code>` immediately above it. No exceptions.
+
+## 8. Wrong signedness in jumps
+
+**Symptom**: comparison gives the wrong answer at boundary values.
+
+**Failure mode**: using `jgt` (unsigned) when you meant `jsgt` (signed), or vice versa. The bit pattern `0xffffffffffffffff` is `2^64 - 1` as unsigned and `-1` as signed. A check like "is balance positive" using `jsgt r1, 0, fail` and an unsigned `r1` will erroneously fail on values above `2^63 - 1`.
+
+**Fix**: use unsigned (`jgt`, etc.) for pointers, lengths, indices, and balances. Use signed (`jsgt`, etc.) only when the value is genuinely a signed quantity that can be negative.
+
+## 9. Misaligned memory access
+
+**Symptom**: runtime traps on a `ldxdw` or `ldxw`.
+
+**Failure mode**: reading an 8-byte value from an address that is not 8-byte aligned. The input region's documented fields are all naturally aligned; misalignment usually comes from your own data layout choices.
+
+**Fix**: when designing account data layouts or stack structures, place each field at an offset that is a multiple of its size. Pad if needed:
+
+```
+# good:
+data[0..1]  u8 bump
+data[1..8]  7 bytes padding
+data[8..16] u64 counter         # 8-byte aligned ✓
+```
+
+## 10. Caller-saved register clobber across syscall
+
+**Symptom**: a value you computed before a syscall is gone after the syscall.
+
+**Failure mode**: silent. The program runs without trapping, but a comparison after the syscall uses garbage from the syscall's return path instead of the value you stored. Often manifests as "the program always succeeds" or "the program always fails."
+
+**Fix**: park values in `r6`-`r9` (callee-saved) before any `call`.
+
+```asm
+mov64 r6, r2                       # save r2 before clobbering
+mov64 r1, r10
+sub64 r1, 40
+call sol_get_clock_sysvar          # r1-r5 clobbered
+# r6 still holds our value
+```
+
+## 11. Reading `r0` after `sol_memcmp_`
+
+**Symptom**: the comparison result is always 0 (always equal).
+
+**Failure mode**: `sol_memcmp_` does not put its result in `r0`. It writes a `u32` into the 4-byte buffer pointed to by `r4`. Reading `r0` after the call gives you the syscall return code (always 0), which looks like "bytes matched" regardless of what the bytes actually were. **Critical vulnerability** when used for pubkey comparison.
+
+**Fix**:
+
+```asm
+ldxw r2, [r4 + 0]   # read result from the buffer
+jne r2, 0, mismatch
+```
+
+## 12. PDA seed order
+
+**Symptom**: PDA derivation succeeds, but the derived address never matches the passed-in account.
+
+**Failure mode**: seeds passed to `sol_create_program_address` must match the order used to derive the PDA originally (off-chain or in an init handler). Swapping any two seeds produces a different address. If you also swap them in your validation, the program "works" but is now deriving a different PDA than the one users hold.
+
+**Fix**: document the seed order in your `.equ` block or in a comment at the top of the file. Match it byte-for-byte with whatever client tooling derives.
+
+## 13. Forgetting to validate before CPI
+
+**Symptom**: a malicious caller triggers a CPI by passing invalid inputs that bypass earlier checks.
+
+**Failure mode**: CPI is the most expensive thing your program does and the most dangerous. If you build CPI structures from caller-provided accounts before validating those accounts (signer flag, owner, PDA derivation), you may invoke another program with attacker-chosen data.
+
+**Fix**: validate all accounts first, then build CPI structures. The walkthrough chapter's order is the template: signer check → writability check → PDA derivation → PDA validation → state mutation. If a CPI is involved, it goes after all of this.
+
+## Audit checklist
+
+For any program before mainnet:
+
+- [ ] Every signer-required path checks `is_signer`.
+- [ ] Every account you read from has its owner verified (or is one the runtime guarantees, like a sysvar).
+- [ ] Every PDA used is verified via `sol_create_program_address` + `sol_memcmp_`.
+- [ ] Every account you write to has `is_writable` checked.
+- [ ] Every entry point validates `instruction_data_len` and `num_accounts`.
+- [ ] Every `exit` is preceded by an explicit `mov64 r0, <code>`.
+- [ ] All comparisons use the correct signed/unsigned variant.
+- [ ] All multi-byte loads and stores are naturally aligned.
+- [ ] Every value needed past a `call` lives in `r6`-`r9` before the call.
+- [ ] `sol_memcmp_` results are read from `r4`'s buffer, not `r0`.
+- [ ] Validation runs before any CPI.

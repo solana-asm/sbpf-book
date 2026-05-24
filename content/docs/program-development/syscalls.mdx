@@ -1,0 +1,251 @@
+---
+title: Syscalls
+description: The runtime syscalls available via the call instruction. Signatures, return semantics, and CU costs.
+---
+
+Every syscall is invoked with `call <name>`. Arguments live in `r1` through `r5` in order. The return value comes back in `r0`. Registers `r6` through `r9` are preserved; `r1` through `r5` should be assumed clobbered.
+
+All syscall names below are resolved by the sBPF assembler against the runtime's syscall table.
+
+## Logging
+
+### `sol_log_`
+
+```
+sol_log_(message_ptr: *const u8, message_len: u64)
+```
+
+Writes a UTF-8 string to the transaction log.
+
+- `r1`: pointer to bytes
+- `r2`: length in bytes
+- `r0`: not meaningful
+
+**Cost**: `~100 CU` base + `~1 CU per byte`. A 15-byte log is roughly `115 CU`.
+
+### `sol_log_64_`
+
+```
+sol_log_64_(a: u64, b: u64, c: u64, d: u64, e: u64)
+```
+
+Logs five `u64` values as hexadecimal, space-separated, on one line. Useful for printf-style debugging.
+
+- `r1`–`r5`: the five values
+- `r0`: not meaningful
+
+**Cost**: `~100 CU`.
+
+## Sysvar reads
+
+Each of these writes a struct of fixed size into a buffer at `r1`. The buffer must be at least the struct's size and 8-byte aligned.
+
+### `sol_get_clock_sysvar`
+
+```
+sol_get_clock_sysvar(out: *mut Clock)
+```
+
+Writes 40 bytes: `slot (u64) | epoch_start_timestamp (i64) | epoch (u64) | leader_schedule_epoch (u64) | unix_timestamp (i64)`.
+
+- `r1`: pointer to a 40-byte buffer
+- `r0`: 0 on success
+
+**Cost**: `100 CU` base + `40 CU` for the struct size = `~140 CU`.
+
+### `sol_get_rent_sysvar`
+
+```
+sol_get_rent_sysvar(out: *mut Rent)
+```
+
+Writes 17 bytes: `lamports_per_byte_year (u64) | exemption_threshold (f64) | burn_percent (u8)`.
+
+- `r1`: pointer to a 17-byte buffer (round up to 24 for alignment)
+- `r0`: 0 on success
+
+**Cost**: `~117 CU`.
+
+### `sol_get_epoch_schedule_sysvar`
+
+```
+sol_get_epoch_schedule_sysvar(out: *mut EpochSchedule)
+```
+
+Writes 33 bytes describing the cluster's epoch schedule.
+
+**Cost**: `~133 CU`.
+
+### `sol_get_epoch_rewards_sysvar`
+
+Writes the current epoch rewards struct (16 bytes).
+
+**Cost**: `~116 CU`.
+
+### `sol_get_last_restart_slot_sysvar`
+
+Writes the last restart slot (8 bytes).
+
+**Cost**: `~108 CU`.
+
+## Memory operations
+
+### `sol_memcmp_`
+
+```
+sol_memcmp_(a: *const u8, b: *const u8, len: u64, result: *mut u32)
+```
+
+Compares `len` bytes at `a` and `b`. Writes the result as a `u32` into the buffer at `result` (not into `r0`). Result is `0` if all bytes match, non-zero otherwise.
+
+- `r1`: pointer to first buffer
+- `r2`: pointer to second buffer
+- `r3`: byte length to compare
+- `r4`: pointer to a 4-byte result buffer
+
+**Cost**: depends on length; roughly `~10 CU` base + `~1 CU per 8 bytes`.
+
+<div className="not-prose my-4 rounded-lg border border-fd-border bg-fd-card p-3 text-sm">
+  <strong>Convention gotcha:</strong> the comparison result is in the 4-byte buffer at <code>r4</code>, <em>not</em> in <code>r0</code>. <code>r0</code> is always 0. The most-missed convention in asm-on-Solana.
+</div>
+
+### `sol_memcpy_`
+
+```
+sol_memcpy_(dst: *mut u8, src: *const u8, len: u64)
+```
+
+Copies `len` bytes from `src` to `dst`. The buffers must not overlap.
+
+- `r1`: dst
+- `r2`: src
+- `r3`: length
+
+**Cost**: roughly `~10 CU` base + `~1 CU per 8 bytes`.
+
+### `sol_memmove_`
+
+Same as `sol_memcpy_` but tolerates overlapping buffers. Marginally more expensive.
+
+### `sol_memset_`
+
+```
+sol_memset_(dst: *mut u8, byte: u64, len: u64)
+```
+
+Fills `len` bytes at `dst` with the low byte of `byte`.
+
+## PDA derivation
+
+### `sol_create_program_address`
+
+```
+sol_create_program_address(
+  seeds:        *const SolBytes,    // array of {ptr, len}
+  seeds_len:    u64,                // count of seed entries
+  program_id:   *const [u8; 32],    // 32-byte pubkey of deriving program
+  out:          *mut [u8; 32]       // where to write the resulting PDA
+)
+```
+
+Derives a PDA from `program_id` and the ordered seed bytes. The seed bytes typically include the canonical bump as the last seed. If the seeds + program ID hash falls on the ed25519 curve, the syscall fails.
+
+- `r1`: pointer to SolBytes array
+- `r2`: number of seeds
+- `r3`: pointer to program ID (32 bytes)
+- `r4`: pointer to output buffer (32 bytes)
+- `r0`: 0 on success
+
+**Cost**: `~1500 CU`.
+
+### `sol_try_find_program_address`
+
+```
+sol_try_find_program_address(
+  seeds: *const SolBytes,
+  seeds_len: u64,
+  program_id: *const [u8; 32],
+  out: *mut [u8; 32],
+  bump: *mut u8
+)
+```
+
+Like `sol_create_program_address` but searches downward from bump `255` for a valid PDA. Writes the canonical bump into `*bump`. Expensive; off-chain code typically does this search once and stores the bump.
+
+**Cost**: `~1500 CU per bump tried` (up to ~256 iterations). Avoid on-chain.
+
+## Cross-program invocation
+
+### `sol_invoke_signed_c`
+
+```
+sol_invoke_signed_c(
+  instruction:        *const SolInstruction,
+  account_infos:      *const SolAccountInfo,
+  account_infos_len:  u64,
+  signer_seeds:       *const SolSignerSeeds,
+  signer_seeds_len:   u64
+)
+```
+
+Invokes another program with the given instruction and accounts, optionally signing for PDAs derived from `signer_seeds`.
+
+- `r1`: pointer to `SolInstruction` (40 bytes)
+- `r2`: pointer to `SolAccountInfo[]` (56 bytes per entry)
+- `r3`: account count
+- `r4`: pointer to `SolSignerSeeds[]` or 0 for no PDA signing
+- `r5`: signer seed entry count or 0
+- `r0`: 0 if the callee succeeded, non-zero if it failed
+
+If the callee fails, your program's transaction also fails regardless of what you do with `r0`. The runtime propagates the failure.
+
+**Cost**: `~1000 CU` base + the callee's CU. A System Program transfer via CPI costs roughly `~1500 CU` total.
+
+### `sol_invoke_signed_rust`
+
+Same as `sol_invoke_signed_c` but uses the Rust ABI layout for the structs (slightly different padding). Almost never needed in pure asm; `_c` is the canonical choice.
+
+## Hashing
+
+| Syscall | Hash | Cost |
+|---|---|---|
+| `sol_sha256` | SHA-256 | `~85 CU + 0.5 CU per byte` |
+| `sol_keccak256` | Keccak-256 | `~85 CU + 0.5 CU per byte` |
+| `sol_blake3` | Blake3 | `~85 CU + 0.5 CU per byte` |
+| `sol_poseidon` | Poseidon | `~10000 CU` per round |
+
+Each takes `(slices: *const SolBytes[], slices_len: u64, out: *mut [u8; 32])`.
+
+## Cryptographic verification
+
+| Syscall | What | Cost |
+|---|---|---|
+| `sol_secp256k1_recover` | Recover secp256k1 pubkey from signature | `~25000 CU` |
+| `sol_curve_validate_point` | Check ed25519 / Ristretto point validity | `~140 CU` |
+| `sol_alt_bn128_compression` | Decompress alt-bn128 points | varies |
+
+## Program identity
+
+### `sol_set_return_data`
+
+```
+sol_set_return_data(data: *const u8, len: u64)
+```
+
+Sets the return data the caller can read after the CPI returns. Up to 1024 bytes.
+
+**Cost**: `~10 CU + 1 CU per byte`.
+
+### `sol_get_return_data`
+
+```
+sol_get_return_data(out: *mut u8, len: u64, program_id: *mut [u8; 32]) -> u64
+```
+
+Reads the return data from the most recent CPI. Returns the length of the data.
+
+**Cost**: `~10 CU`.
+
+## All costs are approximate
+
+These costs come from the published Solana compute budget table. They may change between runtime versions. Always benchmark your real program before relying on a specific number.

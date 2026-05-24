@@ -1,0 +1,174 @@
+---
+title: PDAs
+description: Program-derived addresses, the syscall that derives them, and the validation step you must not skip.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+A Program-Derived Address (PDA) is a pubkey that intentionally has no associated private key. It's derived deterministically from a program ID and a list of seed bytes. Because no private key exists, the only way to "sign" for a PDA is to be the program that owns it, calling into another program via `invoke_signed` with the seeds that derived the address.
+
+PDAs are how programs hold authority: a counter program "owns" a counter account at a PDA derived from `["counter", owner_pubkey]`. The program is the only entity that can mutate that account. Users can read it but cannot write.
+
+This chapter covers the two operations every PDA-using program does: derive the address and validate that an account passed in matches the derivation.
+
+## What a PDA actually is
+
+The runtime takes the program ID plus an ordered list of seed byte arrays, plus a single `u8` "bump" byte, hashes them together, and checks whether the result falls off the ed25519 curve. If yes, it's a valid PDA. If no, the bump is wrong and the call fails.
+
+In practice, off-chain code searches downward from bump `255` for the largest bump that yields a valid PDA. That "canonical bump" gets stored alongside whatever struct the PDA holds, so on-chain code can re-derive the same address without searching.
+
+The Anchor parallel:
+```rust
+#[account(seeds = [b"counter", owner.key().as_ref()], bump)]
+pub counter: Account<'info, Counter>,
+```
+
+Anchor stores the bump in the account's data and re-uses it. You will do the same in asm.
+
+## sol_create_program_address
+
+The syscall that does the derivation:
+
+```
+sol_create_program_address(
+  seeds_ptr:  *const SolBytes[],  // array of {ptr, len} structs
+  seeds_len:  u64,                // count of seed entries
+  program_id: *const [u8; 32],    // 32-byte pubkey of the deriving program
+  out:        *mut [u8; 32]       // where to write the resulting PDA
+)
+```
+
+It expects a pointer to a packed array. Each entry is two `u64`s: a pointer to the seed bytes and a length.
+
+## The example layout
+
+We will work through one concrete program for the rest of this chapter: two accounts (the owner at slot 0, the PDA we want to verify at slot 1), and 1 byte of instruction data carrying the canonical bump. The constants block:
+
+```asm title="constants for this chapter"
+.equ NUM_ACCOUNTS,         0x0000
+
+# account 0: owner (signer)
+.equ ACCT0_HEADER,         0x0008
+.equ ACCT0_KEY,            0x0010
+
+# account 1: the candidate PDA we will verify
+.equ ACCT1_HEADER,         0x2868
+.equ ACCT1_KEY,            0x2870
+
+# instruction data: 1 byte bump
+.equ INSTRUCTION_DATA_LEN, 0x50c8
+.equ INSTRUCTION_DATA,     0x50d0
+
+# the program ID lives right after the instruction data
+.equ PROGRAM_ID,           0x50d1
+```
+
+(`PROGRAM_ID = INSTRUCTION_DATA + 1` because the ix data is 1 byte. For an N-byte ix data it would be `INSTRUCTION_DATA + N`.)
+
+Body code in this chapter assumes `r7` holds the saved input pointer (a `mov64 r7, r1` at the top of `entrypoint`).
+
+## Building the seeds array on the stack
+
+The syscall needs a `SolBytes[]` array (each entry is 16 bytes: an 8-byte pointer and an 8-byte length). For three seeds, that's 48 bytes. The seed bytes themselves also need to live somewhere addressable: the bump in a 1-byte stack slot, the string `"counter"` either in `.rodata` or on the stack, and the owner pubkey already in the input region (we just point at it).
+
+To keep the example self-contained, we put `"counter"` in `.rodata`:
+
+```asm title=".rodata at the bottom of the file"
+.rodata
+  seed_counter: .ascii "counter"   # 7 bytes
+```
+
+Then in the body, we allocate three stack slots and fill the SolBytes array:
+
+```asm
+# 1. Stack slot for the bump byte (1 byte; we allocate 8 for alignment).
+#    Assume the bump came in via instruction data; r2 already holds it as a u8.
+ldxb  r2, [r1 + INSTRUCTION_DATA + 0]
+mov64 r9, r10
+sub64 r9, 8
+stxdw [r9 + 0], r2                          # bump in r9 (low byte is what matters)
+
+# 2. Stack slot for the SolBytes array (3 entries × 16 = 48 bytes).
+mov64 r5, r9
+sub64 r5, 48
+
+# entry 0: pointer to "counter" in .rodata, length 7
+lddw  r3, seed_counter
+stxdw [r5 + 0], r3                          # entry 0 ptr
+lddw  r3, 7
+stxdw [r5 + 8], r3                          # entry 0 len
+
+# entry 1: pointer to owner's pubkey in the input region, length 32
+mov64 r3, r7
+add64 r3, ACCT0_KEY
+stxdw [r5 + 16], r3                         # entry 1 ptr
+lddw  r3, 32
+stxdw [r5 + 24], r3                         # entry 1 len
+
+# entry 2: pointer to the bump byte on our stack, length 1
+stxdw [r5 + 32], r9                         # entry 2 ptr
+lddw  r3, 1
+stxdw [r5 + 40], r3                         # entry 2 len
+```
+
+After this, `r5` points to a 48-byte SolBytes array describing three seeds.
+
+<Callout type="info">
+  Building seeds on the stack is verbose. This is one of the few places asm is dramatically wordier than Pinocchio (which has a `Seeds` helper) and Anchor (whose attribute hides it entirely). The verbosity is unavoidable because asm has no compile-time array literals.
+</Callout>
+
+## Calling the syscall
+
+The syscall takes `(seeds_ptr, seed_count, program_id_ptr, output_ptr)` in `r1`-`r4`. We need a 32-byte output buffer for the derived PDA. We allocate it just below the SolBytes array.
+
+```asm
+# Allocate the 32-byte output buffer for the derived PDA, just below r5.
+mov64 r6, r5
+sub64 r6, 32                                # r6 = output buffer (32 bytes)
+
+mov64 r1, r5                                # seeds ptr
+lddw  r2, 3                                 # seed count
+mov64 r3, r7
+add64 r3, PROGRAM_ID                        # program ID ptr (in input region)
+mov64 r4, r6                                # output buffer ptr
+call sol_create_program_address
+```
+
+`r6` (which is callee-saved) survived the call and still points to the 32-byte derived PDA. `r0` is `0` on success.
+
+## Validating the PDA matches the account passed in
+
+The syscall derived an address. It did **not** check that the account at slot 1 actually has that address. That check is your job, and is the single most-missed step.
+
+```asm
+# Compare the derived PDA (32 bytes at r6) against account 1's pubkey.
+# sol_memcmp_ writes its u32 result into a 4-byte buffer pointed at by r4.
+
+mov64 r4, r6
+sub64 r4, 4                                 # 4-byte result buffer just below the PDA buffer
+
+mov64 r1, r6                                # ptr to derived PDA
+mov64 r2, r7
+add64 r2, ACCT1_KEY                         # ptr to account 1's pubkey in input region
+lddw  r3, 32                                # 32 bytes to compare
+call sol_memcmp_
+
+ldxw r2, [r4 + 0]                           # read result: 0 means equal
+jne r2, 0, bad_pda                          # mismatch → refuse the operation
+```
+
+If the comparison result is non-zero, the account at slot 1 is not the PDA derived from our seeds. Refuse the operation.
+
+<Callout type="warn">
+  Forgetting this check is a critical vulnerability. An attacker passes their own account at the "PDA" slot; your program treats it as a real PDA-owned account and mutates it. Anchor's `#[account(seeds = [...], bump)]` runs this check for you; in asm you write it explicitly.
+</Callout>
+
+## The pattern in full
+
+The canonical `sbpf-asm-vault` example does exactly this for a vault PDA derived from `["vault", owner_pubkey, bump]`. The structure of its `prepare seeds + create PDA + memcmp` section is the template you'll repeat across any program that uses PDAs. Read it once, then write it from memory the next time you need it.
+
+## Signing with a PDA in a CPI
+
+The reason programs derive PDAs is to sign transactions on their behalf. When you `sol_invoke_signed_c`, you pass the same seeds array plus the bump as the signer seeds. The runtime re-derives the PDA from those seeds and treats it as a signer for the duration of the CPI.
+
+The next chapter, [CPI](/docs/basics/cpi), covers that full flow.

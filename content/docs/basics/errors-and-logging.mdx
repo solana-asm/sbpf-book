@@ -1,0 +1,154 @@
+---
+title: Errors and Logging
+description: Exit codes, sol_log_, and the discipline of failing safely.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+A Solana program fails by exiting with a non-zero status. The runtime turns that into a transaction-level error and reverts every account change the instruction made. There is no exception machinery, no panic frame, no error type to define. There is `r0` and `exit`.
+
+This chapter covers the four things every program does around failure: emit a log line, set a code, exit cleanly, and pick a stable convention so callers can match on the code.
+
+## Exit codes
+
+Set `r0` before every `exit`. The convention this book recommends:
+
+| `r0` | Meaning |
+|---:|---|
+| `0` | Success |
+| `1` | Logical condition failed (e.g. balance too low, deadline missed, signature mismatch) |
+| `2` | Malformed instruction data (wrong length, bad discriminator) |
+| `3` | Invalid account (wrong owner, wrong size, missing signer, wrong count) |
+
+The Anchor parallel is the `#[error_code]` enum. Each variant gets a number; the SDK matches on those numbers downstream. You are now writing those numbers directly.
+
+<Callout type="warn">
+  Treat exit codes like a public API. Once a downstream client matches on `0x1` meaning "deadline missed", renumbering is a breaking change. Define the convention up front and stick to it across program versions.
+</Callout>
+
+## Always set r0 explicitly
+
+```asm
+mov64 r0, 0
+exit
+```
+
+`r0` is whatever the previous instruction left there. There is no implicit zero, no compiler to insert one. The most common cause of a transaction succeeding when it should have failed is a code path that forgets to set `r0` before `exit`.
+
+The fix is mechanical: every label in your program that ends in `exit` has a `mov64 r0, <code>` immediately above it. No exceptions.
+
+## sol_log_ for human-readable diagnostics
+
+`sol_log_` writes a UTF-8 string to the transaction's log. The string must live in `.rodata` (the read-only data segment) and you must tell the syscall its length in bytes.
+
+```asm
+lddw r1, msg_deadline_missed
+mov64 r2, 15
+call sol_log_
+
+.rodata
+  msg_deadline_missed: .ascii "deadline missed"
+```
+
+`lddw` is the 64-bit load doubleword instruction; it loads the address of the label into `r1`. `r2` is the byte length. The label name (`msg_deadline_missed`) is purely for the assembler; the deployed program contains only the bytes and a constant address.
+
+<Callout type="info">
+  Length is in **bytes**, not characters. Multi-byte UTF-8 will log fewer rendered characters than the byte count implies. Stick to ASCII unless you have a reason not to.
+</Callout>
+
+## Error labels at the bottom of the file
+
+The discipline that makes a 50-line program auditable:
+
+```asm
+.globl entrypoint
+entrypoint:
+  # main body
+  # ...
+
+  mov64 r0, 0
+  exit
+
+# error paths, at the end of the file, each ending in its own exit
+deadline_missed:
+  lddw r1, msg_deadline_missed
+  mov64 r2, 15
+  call sol_log_
+  mov64 r0, 1
+  exit
+
+bad_ix_data:
+  lddw r1, msg_bad_ix_data
+  mov64 r2, 15
+  call sol_log_
+  mov64 r0, 2
+  exit
+
+bad_account:
+  lddw r1, msg_bad_account
+  mov64 r2, 11
+  call sol_log_
+  mov64 r0, 3
+  exit
+
+.rodata
+  msg_deadline_missed: .ascii "deadline missed"
+  msg_bad_ix_data:     .ascii "bad instruction"
+  msg_bad_account:     .ascii "bad account"
+```
+
+The body jumps to these labels via `jne` / `jeq` / `ja`. Each error label is responsible for both logging and exit-code setting. No error path falls through into another.
+
+The Anchor parallel is `require!(cond, MyError::Variant)`. The `require!` macro expands to roughly the same control flow: jump to a labeled error path that logs and returns.
+
+## sol_log_64_ for numeric diagnostics
+
+For five `u64` values written like a printf-style debug line:
+
+```asm
+mov64 r1, 1     # value 1
+mov64 r2, 2
+mov64 r3, 3
+mov64 r4, 4
+mov64 r5, 5
+call sol_log_64_
+```
+
+Logs `0x1 0x2 0x3 0x4 0x5` to the transaction. Useful for dumping computed values during devnet debugging. Cheap (`~100 CU`) but spammy; remove before mainnet.
+
+## CU cost of logging
+
+`sol_log_` is not free. The runtime charges per byte logged, plus the syscall base cost (`100 CU`). A 15-byte log costs about `115 CU`. Two log lines cost more than the entire `slot_deadline` guard does on its own.
+
+Treat logs like assertions: useful for failure paths (where you've already lost the transaction anyway), expensive for happy paths.
+
+## Events: there are no events
+
+Anchor's `#[event]` and `emit!` macros write a base64-encoded blob into the transaction log under a discriminator the IDL knows about. Indexers parse those logs.
+
+In sBPF you have one mechanism: `sol_log_`. If you want an indexer-parseable event, define your own line format and call `sol_log_` with the bytes. Most asm programs that need events use a small struct serialized to hex or a custom magic prefix to distinguish event lines from diagnostic lines.
+
+```asm
+# Pseudocode for emitting "TRANSFER:<from>:<to>:<amount>":
+# 1. Build the bytes on the stack
+# 2. Call sol_log_ with the buffer and its length
+```
+
+For the capstone level, treat events as "log a line with a known prefix" and parse those off-chain. No framework needed.
+
+## Constants for messages
+
+Group all `.rodata` strings at the bottom of the file, one per logical message. Hardcoding the byte length next to each call site is acceptable; the alternative (computing lengths via assembler arithmetic) clutters the file.
+
+```asm
+.rodata
+  msg_bad_ix:    .ascii "bad ix"        # length 6
+  msg_no_signer: .ascii "missing sig"   # length 11
+  msg_oom:       .ascii "oom"           # length 3
+```
+
+Count once, hardcode in the `mov64 r2, <len>` next to each `call sol_log_`. If a message changes, update both the string and the length.
+
+## What's next
+
+You can now fail safely and emit diagnostics. The next chapter, [PDAs](/docs/basics/pdas), covers how programs derive authority over accounts they own.

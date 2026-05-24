@@ -1,0 +1,186 @@
+---
+title: Quickstart
+description: Scaffold, build, deploy, and verify your first sBPF program in about five minutes.
+---
+
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+import { Callout } from 'fumadocs-ui/components/callout';
+
+This walkthrough takes you from an empty directory to a deployed program running on a local validator. It assumes the toolchain from the [installation](/docs/installation) page is in place.
+
+## Prerequisites
+
+Verify your environment:
+
+```shell title="Terminal"
+rustc --version
+solana --version
+sbpf --version
+```
+
+You should see version output for all three. If any of them fail, return to the [installation](/docs/installation) page.
+
+## Build your first program
+
+<Steps>
+<Step>
+
+### Initialize a project
+
+```shell title="Terminal"
+sbpf init hello
+cd hello
+```
+
+The scaffolder produces a working Bun + Mocha project shaped like this:
+
+```
+hello/
+├── src/
+│   └── hello/
+│       └── hello.s          # the program source
+├── tests/
+│   └── hello.test.ts        # a default test
+├── deploy/
+│   └── hello-keypair.json   # the program's keypair, i.e. its on-chain address
+├── package.json
+└── tsconfig.json
+```
+
+The default `hello.s` is a no-op program that logs `Hello, Solana!` and exits. Open it to see what 7 lines of working sBPF look like.
+
+```asm title="src/hello/hello.s"
+.globl entrypoint
+entrypoint:
+  lddw r1, message
+  mov64 r2, 14
+  call sol_log_
+  exit
+.rodata
+  message: .ascii "Hello, Solana!"
+```
+
+</Step>
+<Step>
+
+### Build
+
+```shell title="Terminal"
+sbpf build
+```
+
+This invokes the sBPF assembler on every `.s` file under `src/` and writes the deployable ELF to `deploy/hello.so`. The whole build typically finishes in a few milliseconds.
+
+You can inspect the emitted binary by disassembling it:
+
+```shell title="Terminal"
+sbpf disassemble deploy/hello.so
+```
+
+The round-trip should match the source one for one. Use this command often. It is the most direct way to confirm what the assembler actually emitted.
+
+</Step>
+<Step>
+
+### Start a local validator
+
+In a separate terminal:
+
+```shell title="Terminal"
+solana-test-validator
+```
+
+Point the Solana CLI at it:
+
+```shell title="Terminal"
+solana config set -ul
+```
+
+</Step>
+<Step>
+
+### Deploy
+
+```shell title="Terminal"
+sbpf deploy hello
+```
+
+Without a URL argument, `sbpf deploy` targets `localhost`. The wrapper shells out to `solana program deploy` using the deployer keypair from `solana config get` and the program keypair from `deploy/hello-keypair.json`.
+
+```
+🔄 Deploying "hello"
+Program Id: <44-character base58 pubkey>
+Signature: <88-character base58 signature>
+✅ "hello" deployed successfully!
+```
+
+The program is now live on your local validator at the printed program ID. The same program ID will be used on any cluster you deploy this keypair to, so reuse it instead of generating a new keypair when you move to devnet or mainnet.
+
+</Step>
+<Step>
+
+### Run the test
+
+The scaffold ships a TypeScript test that sends an instruction to your deployed program and waits for confirmation. Here is the file `sbpf init` creates:
+
+```ts title="tests/hello.test.ts"
+import {
+  Connection,
+  Keypair,
+  Transaction,
+  TransactionInstruction,
+} from "@solana/web3.js"
+import programSeed from "../deploy/hello-keypair.json"
+
+const programKeypair = Keypair.fromSecretKey(new Uint8Array(programSeed))
+const program = programKeypair.publicKey
+const signerSeed = JSON.parse(process.env.SIGNER!)
+const signer = Keypair.fromSecretKey(new Uint8Array(signerSeed))
+
+const connection = new Connection("http://127.0.0.1:8899", {
+  commitment: "confirmed",
+})
+
+const signAndSend = async (tx: Transaction): Promise<string> => {
+  const block = await connection.getLatestBlockhash()
+  tx.recentBlockhash = block.blockhash
+  return connection.sendTransaction(tx, [signer])
+}
+
+describe("hello solana", () => {
+  it("logs Hello, Solana!", async () => {
+    const tx = new Transaction()
+    tx.add(
+      new TransactionInstruction({
+        keys: [{ pubkey: signer.publicKey, isSigner: true, isWritable: true }],
+        programId: program,
+      })
+    )
+    const sig = await signAndSend(tx)
+    await connection.confirmTransaction(sig)
+    console.log(`https://explorer.solana.com/tx/${sig}?cluster=custom&customUrl=http%3A%2F%2Flocalhost%3A8899`)
+  })
+})
+```
+
+It loads the program ID from the keypair you just deployed, signs with your Solana CLI keypair (passed via the `SIGNER` env var), sends a transaction that includes one account (the signer) and no instruction data, and prints an explorer link.
+
+The `package.json` `test` script wires the keypair into the env so you can just run:
+
+```shell title="Terminal"
+bun install
+bun run test
+```
+
+You should see one passing test and the printed explorer URL. Open it to inspect the on-chain log output (`Hello, Solana!`).
+
+</Step>
+</Steps>
+
+## Where to next
+
+You now have a working build, deploy, and test loop. From here:
+
+- Replace the body of `hello.s` with your own logic. Disassemble after each edit.
+- Read [Installation > sbpf basics](/docs/installation#sbpf-basics) for the full set of `sbpf` subcommands.
+- Move from localhost to devnet by re-running `sbpf deploy hello https://api.devnet.solana.com` after an `solana airdrop 2 --url devnet`.

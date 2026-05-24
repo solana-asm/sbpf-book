@@ -1,0 +1,193 @@
+---
+title: Writing a Client
+description: A TypeScript template for calling your sBPF program. Encode instruction data, derive PDAs off-chain, build the transaction, sign and send.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+An on-chain program is useless without something that calls it. The "something" is a client: off-chain code that constructs a transaction containing an instruction for your program, signs it, and submits it to the cluster. The Quickstart's scaffolded test is the smallest possible example. This chapter shows the template for a real one.
+
+We'll use the [counter program](/docs/basics/walkthrough) from the Walkthrough chapter as the target. The client we'll write sends the increment instruction (discriminator `1`, plus the bump byte), derives the same PDA the program will validate against, and confirms the transaction.
+
+## What a client does
+
+A client does four things, every time:
+
+1. **Encode the instruction data** as bytes in the exact order your program reads them. Endianness matters: `u64` values go in little-endian.
+2. **Derive any PDAs** off-chain so it knows what pubkey to pass in the AccountMeta array. The seeds and the program ID must exactly match what the program uses with `sol_create_program_address`.
+3. **Build a `TransactionInstruction`** with the program ID, the accounts (each marked `isSigner` and `isWritable` to match what the program expects to read in the account header flags), and the instruction data.
+4. **Sign and send** the transaction with at least the fee payer's keypair.
+
+If any of these four is wrong, the program either fails on-chain (with a non-zero exit code) or fails before landing (preflight rejection).
+
+## The complete client
+
+For the counter program from the Walkthrough, the client is about 60 lines of TypeScript. Read it end to end first, then the explanation follows.
+
+```ts title="client/increment.ts"
+import {
+  Connection,
+  Keypair,
+  PublicKey,
+  Transaction,
+  TransactionInstruction,
+  sendAndConfirmTransaction,
+} from "@solana/web3.js"
+import { readFileSync } from "fs"
+
+// 1. Program ID. Loaded from the keypair file that sbpf init created.
+const programKeypairBytes = JSON.parse(
+  readFileSync("./deploy/counter-keypair.json", "utf-8")
+)
+const programId = Keypair.fromSecretKey(
+  new Uint8Array(programKeypairBytes)
+).publicKey
+
+// 2. The owner: the user who will sign the transaction.
+//    In a real client this is the user's wallet; here we load our CLI keypair.
+const ownerKeypairBytes = JSON.parse(
+  readFileSync(`${process.env.HOME}/.config/solana/id.json`, "utf-8")
+)
+const owner = Keypair.fromSecretKey(new Uint8Array(ownerKeypairBytes))
+
+// 3. Derive the counter PDA off-chain. Seeds must match the program exactly.
+const [counterPda, bump] = PublicKey.findProgramAddressSync(
+  [Buffer.from("counter"), owner.publicKey.toBuffer()],
+  programId
+)
+
+// 4. Encode the instruction data: 1 byte discriminator + 1 byte bump.
+const data = Buffer.from([1, bump])
+
+// 5. Build the instruction. Account order matches the program's .equ block:
+//    account 0 = owner (signer, not writable)
+//    account 1 = counter PDA (writable)
+const ix = new TransactionInstruction({
+  programId,
+  keys: [
+    { pubkey: owner.publicKey, isSigner: true, isWritable: false },
+    { pubkey: counterPda, isSigner: false, isWritable: true },
+  ],
+  data,
+})
+
+// 6. Send + confirm.
+const connection = new Connection("http://127.0.0.1:8899", "confirmed")
+const tx = new Transaction().add(ix)
+const sig = await sendAndConfirmTransaction(connection, tx, [owner])
+
+console.log(`incremented; tx ${sig}`)
+console.log(`counter PDA: ${counterPda.toBase58()}`)
+```
+
+Save as `client/increment.ts`, install `@solana/web3.js` and `tsx`, run with `tsx client/increment.ts`. The program increments the counter and prints the signature.
+
+## Walking through it
+
+### Loading the program ID
+
+```ts
+const programId = Keypair.fromSecretKey(...).publicKey
+```
+
+The deploy keypair is the program's identity. The file is the same one `sbpf init` created and `sbpf deploy` published; the client just reads the public key from it. This works on any cluster, since the same keypair always produces the same program ID.
+
+### Deriving the PDA
+
+```ts
+const [counterPda, bump] = PublicKey.findProgramAddressSync(
+  [Buffer.from("counter"), owner.publicKey.toBuffer()],
+  programId
+)
+```
+
+`findProgramAddressSync` is the off-chain equivalent of `sol_create_program_address` plus a bump search. It tries bumps from 255 downward and returns the first one that produces a valid (off-curve) address, plus that bump value.
+
+The seeds list must be byte-identical to what the program expects: same strings, same pubkey bytes, same order. The bump search is exactly what the program does NOT do (it uses the bump you pass it as a seed and validates the result). The client computes the bump once and passes it in the instruction data.
+
+<Callout type="warn">
+  The seeds passed to `findProgramAddressSync` exclude the bump byte. The seeds passed to `sol_create_program_address` on-chain include the bump byte as the last seed. The library handles this asymmetry; you don't think about it as long as you derive client-side with `findProgramAddressSync` and validate on-chain with the explicit bump.
+</Callout>
+
+### Encoding instruction data
+
+```ts
+const data = Buffer.from([1, bump])
+```
+
+Two bytes: discriminator (`1` for increment), then the bump. The order matches what the program reads with `ldxb [r1 + INSTRUCTION_DATA + 0]` (discriminator) and `ldxb [r1 + INSTRUCTION_DATA + 1]` (bump).
+
+For larger values, encode in little-endian (Solana's native order):
+
+```ts
+// Encoding a u64 lamport amount:
+const amountLE = Buffer.alloc(8)
+amountLE.writeBigUInt64LE(BigInt(1_000_000), 0)
+const data = Buffer.concat([Buffer.from([2]), amountLE])  // discriminator 2 + 8 bytes
+```
+
+Byte order is the single most common client-side bug. `ldxdw` reads 8 bytes from memory in the platform's native order, which is little-endian on every architecture Solana validators run. Encoding big-endian on the client gives you arithmetically nonsensical values on-chain.
+
+### Building the instruction
+
+```ts
+new TransactionInstruction({
+  programId,
+  keys: [
+    { pubkey: owner.publicKey, isSigner: true, isWritable: false },
+    { pubkey: counterPda, isSigner: false, isWritable: true },
+  ],
+  data,
+})
+```
+
+The order of `keys` is the order the program will see in the input region. Account 0 is at offset `0x0008`, account 1 at `0x2868`, and so on. Swapping them swaps what `[r1 + ACCT0_*]` and `[r1 + ACCT1_*]` resolve to.
+
+`isSigner` and `isWritable` must match what the program checks:
+
+- The program reads `is_signer` at `ACCT0_HEADER + 1`. If the client claims `isSigner: false` here, the program's signer check fails.
+- The program reads `is_writable` at `ACCT1_HEADER + 2`. If the client says `isWritable: false` here, the runtime traps when the program tries to `stxdw` into the account.
+
+### Sending and confirming
+
+```ts
+const sig = await sendAndConfirmTransaction(connection, tx, [owner])
+```
+
+The third argument is the array of signing keypairs. The fee payer (the first signer; here, `owner`) covers the transaction fee. `sendAndConfirmTransaction` blocks until the transaction reaches `confirmed` commitment (about one slot, ~400 ms) or fails.
+
+## Decoding errors
+
+When your program exits with a non-zero code, `sendAndConfirmTransaction` throws a `SendTransactionError`. The relevant bit is in `error.logs`:
+
+```
+Transaction failed: ... custom program error: 0x1
+Program log: deadline missed
+```
+
+The hex code maps to the `r0` value your program set before `exit`. The log line is whatever `sol_log_` printed. This is why the [Errors chapter](/docs/basics/errors-and-logging) recommends `sol_log_` before every non-zero exit: it's the only way the client knows *which* condition failed.
+
+To inspect logs programmatically:
+
+```ts
+try {
+  await sendAndConfirmTransaction(connection, tx, [owner])
+} catch (err) {
+  if (err instanceof SendTransactionError) {
+    const logs = await err.getLogs(connection)
+    console.error(logs)
+  }
+}
+```
+
+## Common pitfalls
+
+- **Wrong account order in `keys`.** The program reads `ACCT0_*` first, `ACCT1_*` second. The client must list them in the same order.
+- **Wrong signer/writable flags.** If the program checks `is_signer` on account 0 and the client says `isSigner: false`, the program rejects. If the program writes to account 1 and the client says `isWritable: false`, the runtime traps.
+- **Big-endian instruction data.** Solana is little-endian. Always use `writeBigUInt64LE` / `writeUInt32LE` / etc., never the BE variants.
+- **PDA derivation drift.** If the program adds a seed and you forget to update the client (or vice versa), the derived address won't match the on-chain validation and every transaction fails with the PDA error.
+- **Forgetting to fund the fee payer.** `sendAndConfirmTransaction` will reject if the signer has zero balance. On devnet, `solana airdrop` first. On localhost, the test validator auto-funds your default keypair.
+
+## What to read next
+
+You can now write programs and call them. The final chapter, [Deploying](/docs/basics/deploying), covers the path from localhost to devnet to mainnet: funding the deployer, upgrading a live program, and reclaiming rent when you retire one.

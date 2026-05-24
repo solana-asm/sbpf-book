@@ -1,0 +1,189 @@
+---
+title: Account Data
+description: Reading account fields, writing back to account data, and validating who you trust.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+State on Solana lives in accounts. A program does not own variables across invocations; it reads from accounts the caller passed in, mutates the ones marked writable, and exits. This chapter covers the four things every program does with accounts: read a field, validate the account, write back data, and refuse work when something doesn't match.
+
+## The account header
+
+Every non-duplicate account begins with an 8-byte header. The bytes after the header are the pubkey, owner, lamports, data length, data, and rent epoch.
+
+| Offset | Size | Field |
+|---:|---:|---|
+| `+0x00` | 1 | `dup_flag` (`0xff` when this is a fresh account) |
+| `+0x01` | 1 | `is_signer` (1 if signed the transaction) |
+| `+0x02` | 1 | `is_writable` (1 if the runtime allows mutation) |
+| `+0x03` | 1 | `is_executable` (1 for deployed programs) |
+| `+0x04` | 4 | padding |
+| `+0x08` | 32 | `pubkey` |
+| `+0x28` | 32 | `owner` (the program ID that owns this account's data) |
+| `+0x48` | 8 | `lamports` |
+| `+0x50` | 8 | `data_len` |
+| `+0x58` | 10240 | `data` (actual + padding) |
+| `+0x2858` | 8 | `rent_epoch` |
+
+Use these as offsets from the account's header start. For account 0 the header is at `0x0008`, so the pubkey is at `0x0008 + 0x08 = 0x0010`.
+
+## Reading a fixed-size field
+
+`ldxdw` reads 8 bytes. `ldxw` reads 4. `ldxh` reads 2. `ldxb` reads 1. All require their natural alignment (8-byte read needs 8-byte aligned address, etc.). The runtime enforces this.
+
+```asm
+.equ ACCT0_LAMPORTS, 0x0050
+.equ ACCT0_DATA_LEN, 0x0058
+
+ldxdw r2, [r1 + ACCT0_LAMPORTS]    # r2 = lamports (u64)
+ldxdw r3, [r1 + ACCT0_DATA_LEN]    # r3 = data_len (u64)
+```
+
+The Anchor parallel:
+```rust
+let lamports = ctx.accounts.foo.lamports();
+let data_len = ctx.accounts.foo.try_borrow_data()?.len();
+```
+
+## Validating signer
+
+A signer flag protects every privileged operation. Forget the check and an unsigned account flows past it.
+
+```asm
+.equ ACCT0_HEADER, 0x0008
+
+ldxb r2, [r1 + ACCT0_HEADER + 1]   # is_signer is at header+1
+jeq r2, 0, not_signer
+```
+
+The Anchor parallel is the `Signer<'info>` type wrapper. Anchor enforces the same byte check; you are now doing it by hand.
+
+<Callout type="warn">
+  Validate signer before reading any other field of the account. A program that reads the pubkey first and only later checks `is_signer` is one refactor away from doing privileged work without authorization.
+</Callout>
+
+## Validating owner
+
+An account stores arbitrary bytes. Without checking who owns it, anyone could pass an attacker-controlled account that happens to have the right shape. The owner field at `header + 0x28` is set by the BPF Loader when the account was created and cannot be forged.
+
+```asm
+.equ ACCT0_OWNER, 0x0030
+
+.rodata
+  expected_owner: .ascii "<32 bytes of the expected owner pubkey>"
+
+# Prerequisites:
+#   r7 holds the saved input pointer (entry r1).
+# sol_memcmp_ takes (r1: ptr, r2: ptr, r3: len, r4: 4-byte result buffer)
+# and writes a u32 into the result buffer (0 means the bytes matched).
+
+mov64 r4, r10
+sub64 r4, 4                        # 4-byte aligned stack slot for the result
+
+lddw r1, expected_owner            # r1 = pointer to expected owner (32 bytes in .rodata)
+mov64 r2, r7
+add64 r2, ACCT0_OWNER              # r2 = pointer to actual owner in the input region
+lddw r3, 32                        # r3 = 32 bytes to compare
+call sol_memcmp_
+
+ldxw r2, [r4 + 0]                  # read the comparison result
+jne r2, 0, bad_owner               # non-zero means mismatch
+```
+
+The Anchor parallel:
+```rust
+#[account(owner = expected_program::ID)]
+pub foo: Account<'info, MyData>,
+```
+
+<Callout type="info">
+  `sol_memcmp_` returns its result by writing 4 bytes into the buffer pointed to by `r4`, not into `r0`. Reading `r0` after the call will not give you the comparison outcome. This is the single most-missed convention in asm-on-Solana.
+</Callout>
+
+## Reading account data
+
+Account data starts at `header + 0x58` (or `0x0060` for account 0). Treat it as a byte array; you decide the layout.
+
+A common pattern: store a small struct at the top of an account.
+
+```asm
+.equ ACCT0_DATA, 0x0060
+
+# layout we defined for this account (chosen so the u64 lands on an 8-byte boundary):
+#   data[0..1]  : u8 bump byte
+#   data[1..8]  : 7 bytes of padding
+#   data[8..16] : u64 counter
+
+ldxb  r2, [r1 + ACCT0_DATA + 0]      # bump
+ldxdw r3, [r1 + ACCT0_DATA + 8]      # counter (offset 8 is 8-byte aligned)
+```
+
+The padding exists because `ldxdw` requires its address to be 8-byte aligned. `ACCT0_DATA` is `0x0060`, which is divisible by 8, so offset `+8` is also divisible by 8. Reading from `ACCT0_DATA + 1` would trap. Either pad your struct layout (as above) or read byte by byte with `ldxb`.
+
+## Writing back to account data
+
+`stxdw` writes 8 bytes. `stxw` writes 4. `stxh` writes 2. `stxb` writes 1. Writes are only legal on accounts marked writable. The runtime traps otherwise.
+
+```asm
+# increment the u64 counter (at offset 8 of the account's data)
+ldxdw r2, [r1 + ACCT0_DATA + 8]
+add64 r2, 1
+stxdw [r1 + ACCT0_DATA + 8], r2
+```
+
+You can also enforce the writable check explicitly:
+
+```asm
+ldxb r2, [r1 + ACCT0_HEADER + 2]     # is_writable
+jeq r2, 0, not_writable
+```
+
+The Anchor parallel:
+```rust
+#[account(mut)]
+pub foo: Account<'info, MyData>,
+```
+
+## Putting it together: a one-account "increment a counter" handler
+
+```asm
+.equ ACCT0_HEADER, 0x0008
+.equ ACCT0_DATA,   0x0060
+
+# account 0 data layout:
+#   data[0..1]  : u8 bump byte
+#   data[1..8]  : 7 bytes padding
+#   data[8..16] : u64 counter
+
+.globl entrypoint
+entrypoint:
+  # require account 0 to be the signer
+  ldxb r2, [r1 + ACCT0_HEADER + 1]
+  jeq r2, 0, not_signer
+
+  # require account 0 to be writable
+  ldxb r2, [r1 + ACCT0_HEADER + 2]
+  jeq r2, 0, not_writable
+
+  # read counter, increment, write back
+  ldxdw r2, [r1 + ACCT0_DATA + 8]
+  add64 r2, 1
+  stxdw [r1 + ACCT0_DATA + 8], r2
+
+  mov64 r0, 0
+  exit
+
+not_signer:
+  mov64 r0, 3
+  exit
+
+not_writable:
+  mov64 r0, 3
+  exit
+```
+
+26 lines, no syscalls, around 12 CU per invocation. The Anchor equivalent (with `#[derive(Accounts)]`, `Signer`, `Account<'info, Counter>`, and the increment body) is roughly the same source-line count but compiles to 200-300 CU.
+
+## What's next
+
+You can now read account state and write back to it. The next chapter, [Errors and Logging](/docs/basics/errors-and-logging), covers the conventions for failing safely and emitting diagnostics.

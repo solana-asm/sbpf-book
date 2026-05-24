@@ -1,0 +1,308 @@
+---
+title: Installation
+description: Install Rust, the Solana CLI, and the sbpf toolchain on macOS or Linux.
+---
+
+import { Accordion, Accordions } from 'fumadocs-ui/components/accordion';
+import { Step, Steps } from 'fumadocs-ui/components/steps';
+import { Tab, Tabs } from 'fumadocs-ui/components/tabs';
+import { Callout } from 'fumadocs-ui/components/callout';
+
+This page covers the local toolchain needed to write, build, and deploy a Solana program in pure assembly. macOS and Linux are first-class. Windows is supported through WSL.
+
+## Quick install
+
+The Solana CLI ships its own installer that pulls Rust, the Solana CLI, and a few common tools in one shot.
+
+```shell title="Terminal"
+curl --proto '=https' --tlsv1.2 -sSfL https://solana-install.solana.workers.dev | bash
+```
+
+After that, install the `sbpf` CLI from crates.io.
+
+```shell title="Terminal"
+cargo install sbpf
+```
+
+Verify both:
+
+```shell title="Terminal"
+solana --version
+sbpf --version
+```
+
+<Callout type="warn">
+  Windows users: install [WSL](https://learn.microsoft.com/en-us/windows/wsl/install) first, then run every command below inside the Ubuntu (WSL) terminal.
+</Callout>
+
+If the quick install fails or you want to install each piece individually, follow the steps below.
+
+## Install dependencies
+
+<Steps>
+<Step>
+
+### Install Rust
+
+The `sbpf` CLI is built from source via `cargo`. Install Rust through [`rustup`](https://www.rust-lang.org/tools/install).
+
+```shell title="Terminal"
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+```
+
+Reload your `PATH`:
+
+```shell title="Terminal"
+. "$HOME/.cargo/env"
+```
+
+Verify:
+
+```shell title="Terminal"
+rustc --version
+```
+
+</Step>
+<Step>
+
+### Install the Solana CLI
+
+The Solana CLI is required to deploy programs, query account state, and run a local validator.
+
+```shell title="Terminal"
+sh -c "$(curl -sSfL https://release.anza.xyz/stable/install)"
+```
+
+<Tabs groupId="os" items={["macOS", "Linux"]}>
+<Tab value="macOS">
+
+If you use `zsh` (the macOS default):
+
+```shell title="Terminal"
+echo 'export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"' >> ~/.zshrc
+source ~/.zshrc
+```
+
+</Tab>
+<Tab value="Linux">
+
+```shell title="Terminal"
+export PATH="$HOME/.local/share/solana/install/active_release/bin:$PATH"
+```
+
+Add the same line to your shell rc file (`~/.bashrc`, `~/.zshrc`) so it persists.
+
+</Tab>
+</Tabs>
+
+Verify:
+
+```shell title="Terminal"
+solana --version
+```
+
+To upgrade later:
+
+```shell title="Terminal"
+agave-install update
+```
+
+</Step>
+<Step>
+
+### Install the sbpf CLI
+
+`sbpf` is the project scaffolder, assembler driver, and deploy wrapper for pure-asm Solana programs. It is published to crates.io and installs as a regular cargo binary.
+
+```shell title="Terminal"
+cargo install sbpf
+```
+
+Verify:
+
+```shell title="Terminal"
+sbpf --version
+```
+
+<Callout type="info">
+  Source and issues: [blueshift-gg/sbpf](https://github.com/blueshift-gg/sbpf). The companion crate [`sbpf-linker`](https://github.com/blueshift-gg/sbpf-linker) is only needed if you want to relink upstream BPF binaries from Rust into sBPF v0 format; pure assembly projects do not require it.
+</Callout>
+
+</Step>
+</Steps>
+
+## Solana CLI basics
+
+<Steps>
+<Step>
+
+### Configure the cluster
+
+Inspect the current configuration:
+
+```shell title="Terminal"
+solana config get
+```
+
+```
+Config File: /Users/you/.config/solana/cli/config.yml
+RPC URL: https://api.mainnet-beta.solana.com
+WebSocket URL: wss://api.mainnet-beta.solana.com/ (computed)
+Keypair Path: /Users/you/.config/solana/id.json
+Commitment: confirmed
+```
+
+Switch cluster:
+
+```shell title="Terminal"
+solana config set -um    # mainnet-beta
+solana config set -ud    # devnet
+solana config set -ul    # localhost
+solana config set -ut    # testnet
+```
+
+</Step>
+<Step>
+
+### Create a wallet
+
+```shell title="Terminal"
+solana-keygen new
+```
+
+The default keypair path is `~/.config/solana/id.json`. Use `--outfile <path>` to keep separate keypairs per cluster, then point the config at the one you want with `solana config set --keypair <path>`.
+
+Print your address:
+
+```shell title="Terminal"
+solana address
+```
+
+</Step>
+<Step>
+
+### Fund devnet
+
+```shell title="Terminal"
+solana config set -ud
+solana airdrop 2
+solana balance
+```
+
+Airdrops are rate-limited. If you hit a limit, use the [Solana Web Faucet](https://faucet.solana.com) instead.
+
+</Step>
+<Step>
+
+### Run a local validator
+
+In a separate terminal:
+
+```shell title="Terminal"
+solana-test-validator
+```
+
+Point your config at localhost:
+
+```shell title="Terminal"
+solana config set -ul
+```
+
+</Step>
+</Steps>
+
+## sbpf basics
+
+<Steps>
+<Step>
+
+### Initialize a project
+
+```shell title="Terminal"
+sbpf init my_program
+cd my_program
+```
+
+This scaffolds a Bun + Mocha test project with a single empty program under `src/my_program/my_program.s` and a deploy keypair under `deploy/my_program-keypair.json`.
+
+</Step>
+<Step>
+
+### Build
+
+```shell title="Terminal"
+sbpf build
+```
+
+The assembler compiles every `.s` file under `src/` into a deployable `.so` under `deploy/`.
+
+</Step>
+<Step>
+
+### Deploy
+
+```shell title="Terminal"
+sbpf deploy my_program https://api.devnet.solana.com
+```
+
+`sbpf deploy` is a thin wrapper around `solana program deploy`. The deployer keypair comes from `solana config get`. If no URL is passed, sbpf defaults to localhost.
+
+</Step>
+<Step>
+
+### Disassemble
+
+```shell title="Terminal"
+sbpf disassemble deploy/my_program.so
+```
+
+Round-trips the deployed bytes back to assembly. Read the output of this command often. It is the most direct way to verify the assembler emitted what you wrote.
+
+</Step>
+</Steps>
+
+## Shell completions
+
+The Solana CLI ships completion generators for `bash`, `fish`, and `zsh`. Add them once and `solana <tab>` works in every new shell.
+
+<Tabs groupId="shell" items={["zsh", "bash", "fish"]}>
+<Tab value="zsh">
+
+If you do not already use `oh-my-zsh`, ensure your `~/.zshrc` has:
+
+```shell title="~/.zshrc"
+autoload -U compinit
+compinit -i
+```
+
+Then:
+
+```shell title="Terminal"
+solana completion --shell zsh | sudo tee /usr/local/share/zsh/site-functions/_solana
+exec zsh
+```
+
+</Tab>
+<Tab value="bash">
+
+```shell title="Terminal"
+mkdir -p $HOME/.local/share/bash-completion/completions
+solana completion --shell bash > $HOME/.local/share/bash-completion/completions/solana
+exec bash
+```
+
+</Tab>
+<Tab value="fish">
+
+```shell title="Terminal"
+mkdir -p $HOME/.config/fish/completions
+solana completion --shell fish > $HOME/.config/fish/completions/solana.fish
+source $HOME/.config/fish/config.fish
+```
+
+</Tab>
+</Tabs>
+
+## Further reading
+
+For broader Solana development tutorials, mini-projects, and learning paths from the team behind sbpf, see the [Blueshift Learn](https://learn.blueshift.gg) site and the [blueshift-gg](https://github.com/blueshift-gg) GitHub organization.

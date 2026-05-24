@@ -1,0 +1,145 @@
+---
+title: Registers and Memory
+description: The eleven registers of sBPF, the four memory regions, and the calling convention every program follows.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+sBPF is a virtual machine. A virtual machine, like a real CPU, is built around two things: a small set of registers it can read and write at almost no cost, and a larger memory space it can read and write more slowly. To write any program in assembly, the first thing you need is a complete picture of both.
+
+This chapter is reference material. You will come back to it. It contains no surprises and no opinions, just the rules of the machine.
+
+## Registers
+
+A register is a 64-bit slot of storage inside the virtual machine. Every instruction that operates on data either reads from a register, writes to a register, or both. sBPF has eleven registers, named `r0` through `r10`. Each has a fixed role.
+
+| Register | Role |
+|---|---|
+| `r0` | The program's return value (set before `exit`). Also the return value of any syscall. |
+| `r1` | First argument to a syscall. **On program entry, this is the pointer to the input region.** |
+| `r2` | Second argument to a syscall. |
+| `r3` | Third argument to a syscall. |
+| `r4` | Fourth argument to a syscall. |
+| `r5` | Fifth argument to a syscall. |
+| `r6` | General purpose, callee-saved across syscalls. |
+| `r7` | General purpose, callee-saved across syscalls. |
+| `r8` | General purpose, callee-saved across syscalls. |
+| `r9` | General purpose, callee-saved across syscalls. |
+| `r10` | Read-only stack pointer. Points to the top of the stack. Cannot be the destination of a write. |
+
+Each register holds 64 bits. That fits any unsigned integer up to `2^64 - 1`, any signed integer in the range `-2^63` to `2^63 - 1`, or any 64-bit pointer into memory.
+
+### The calling convention
+
+Every syscall and every program-to-program boundary on sBPF follows the same convention:
+
+- Arguments to a syscall go in `r1`, `r2`, `r3`, `r4`, `r5`, in order. A syscall that takes three arguments uses `r1`, `r2`, `r3` and ignores `r4` and `r5`.
+- The return value of a syscall comes back in `r0`.
+- Registers `r1` through `r5` are **caller-saved**. The syscall is free to overwrite them with anything. If you needed those values after the call, you should have saved them somewhere.
+- Registers `r6` through `r9` are **callee-saved**. The syscall promises to leave them unchanged. You can rely on the values in `r6`-`r9` being the same before and after a `call`.
+- `r10` is preserved (the stack pointer cannot move because you cannot write to `r10` in the first place).
+
+The practical rule that follows from this:
+
+> Before any `call` instruction, move any value you need to keep past the call into one of `r6` through `r9`.
+
+Forgetting this is the single most common bug in hand-written programs. You compute a value in `r2`, then you call a syscall, then you try to use `r2` and it is now whatever the syscall left there (usually zero).
+
+### Why r10 is read-only
+
+The stack pointer is sacred. If your program could overwrite `r10`, it could "lose" the stack: a single bad write would orphan the memory the runtime gave you and any subsequent stack operation would land in undefined territory. By making `r10` read-only as a destination, the instruction set removes the foot-gun entirely. You allocate stack space by reading `r10`, computing a new address (e.g. `r10 - 40`), and storing that into another register. `r10` itself never changes from program start to program end.
+
+## Memory
+
+sBPF programs see four distinct memory regions, each at a fixed virtual address. The runtime maps them into the virtual machine before your program starts.
+
+| Region | Base virtual address | Size | What lives here | Write access |
+|---|---|---|---|---|
+| Program | `0x100000000` | varies (your `.text` + `.rodata`) | Your compiled bytecode and any read-only constants you put in `.rodata`. | Read-only |
+| Stack | `0x200000000` | 4 KB | Whatever you write to it. Grows downward from the top. | Read-write |
+| Heap | `0x300000000` | 32 KB | Heap memory. Opt-in; pure assembly programs almost never use this. | Read-write |
+| Input | `0x400000000` | varies | The serialised buffer of accounts and instruction data the runtime prepared for this call. | Mixed: some fields writable, most not |
+
+You almost never refer to these addresses by their absolute values. The runtime hands you pointers (`r1` to the input on entry, `r10` to the stack on entry) and you compute offsets from those.
+
+### Addressing modes
+
+There is exactly one way to refer to a memory location in an instruction: `[base + offset]`, where `base` is a register and `offset` is a 16-bit signed immediate.
+
+```asm
+ldxdw r2, [r1 + 8]       # read 8 bytes at (r1 + 8) into r2
+stxdw [r9 + 16], r3      # write the 8 bytes of r3 to (r9 + 16)
+ldxb  r4, [r1 + 0x2870]  # read 1 byte at (r1 + 0x2870) into r4
+```
+
+The offset is signed and bounded to `-32768` to `+32767`. To address further than that from a base register, you first add a large value into another register and use the resulting register as the base.
+
+### Alignment
+
+Every memory read and write must be naturally aligned for its size:
+
+| Operation size | Required alignment |
+|---|---|
+| 1 byte | none |
+| 2 bytes | 2-byte aligned (address divisible by 2) |
+| 4 bytes | 4-byte aligned |
+| 8 bytes | 8-byte aligned |
+
+If you violate alignment, the runtime traps and your transaction aborts. The input region's layout is designed so every field's natural offset is correctly aligned (for example, the 4-byte padding after the account flag bytes exists precisely so the 32-byte pubkey starts at an 8-byte boundary). When you build your own structures on the stack, you are responsible for the alignment.
+
+## The stack in detail
+
+The stack is the only memory region you write to from your own program for short-lived data. It is 4 kilobytes and lives at virtual address `0x200000000`.
+
+On entry, `r10` holds a pointer to the **top** of the stack: address `0x200001000` (top + 4096 bytes). The stack grows **downward**, toward lower addresses. To allocate space, you subtract from `r10` and store the result into another register:
+
+```asm
+mov64 r9, r10      # r9 = top of stack
+sub64 r9, 40       # r9 = top of stack - 40 (a 40-byte slot)
+```
+
+`r9` now points to a 40-byte slot you have implicitly reserved (nothing else is going to write there during your program's execution, assuming you don't allocate more slots that overlap). You can read or write through `r9` like any other pointer:
+
+```asm
+stxdw [r9 + 0], r2     # write r2 to the first 8 bytes of the slot
+stxdw [r9 + 8], r3     # write r3 to the next 8 bytes
+ldxdw r4, [r9 + 0]     # read the first 8 bytes back into r4
+```
+
+To allocate a second slot below the first, repeat the pattern with another register:
+
+```asm
+mov64 r8, r9
+sub64 r8, 16       # r8 = r9 - 16, a 16-byte slot below the 40-byte one
+```
+
+There is no `push` or `pop` instruction. You manage stack allocation by hand using `mov` and `sub`. The convention in this book and in the canonical sbpf examples is to use `r9`, `r8`, `r7`, `r6` (in that order) as base pointers to successively lower stack slots.
+
+<Callout type="warn">
+  You cannot write to `r10` directly. The instruction `mov64 r10, r9` would not assemble; even if it did, the runtime would reject it. You always compute a new pointer into another register.
+</Callout>
+
+## A concrete example
+
+This sequence, taken straight from a real program, sets up a 40-byte buffer on the stack, calls `sol_get_clock_sysvar` (which writes 40 bytes of `Clock` data into the buffer), and reads the first 8 bytes (the current slot) back out.
+
+```asm
+ldxdw r6, [r1 + INSTRUCTION_DATA]   # park ix data value in r6 (callee-saved)
+
+mov64 r1, r10
+sub64 r1, 40                        # r1 = address of a 40-byte stack buffer
+call sol_get_clock_sysvar           # syscall writes 40 bytes there
+                                    # r0 = syscall return (0 on success)
+                                    # r1-r5 are now clobbered
+                                    # r6 is still our parked value
+
+mov64 r2, r10
+sub64 r2, 40                        # r2 = same buffer address (recomputed)
+ldxdw r3, [r2 + 0]                  # r3 = first 8 bytes (Clock.slot)
+```
+
+Every concept in this chapter shows up: the read on entry uses `r1` (input pointer), we park our value in `r6` because we know the syscall will clobber `r1`-`r5`, we compute stack addresses by subtracting from `r10`, and we re-compute the stack address after the call because we cannot trust `r1`-`r5` to have survived.
+
+## What to read next
+
+The next chapter, [Instructions](/docs/assembly/instructions), enumerates the sBPF instructions you will use across the book: `mov`, the load/store family, arithmetic, jumps, and the special `call` and `exit`.

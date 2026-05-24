@@ -1,0 +1,390 @@
+---
+title: A Complete Walkthrough
+description: One program that ties together everything from the previous chapters. Build, deploy, and explain each line.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+You have read about program structure, account data, errors, PDAs, CPI, and creating accounts as isolated topics. This chapter combines them into one program you can deploy and call. We use every idiom from the previous chapters in roughly 60 lines of assembly.
+
+The program is a per-user counter. Each user has their own counter account stored at a PDA derived from `["counter", their_pubkey, bump]`. They call the program with discriminator `1` to increment their counter. Only the owner of the counter can increment it.
+
+This chapter implements only the increment handler so the example fits in your head. The init handler that creates the counter PDA in the first place is covered in the preceding [Creating Accounts](/docs/basics/creating-accounts) chapter; a real program combines both into one source file dispatched on a discriminator byte.
+
+## Specification
+
+**Accounts** (in order):
+1. **Owner** — signer, not writable. The user invoking the program.
+2. **Counter PDA** — writable. Derived from `["counter", owner.key, bump]`. Holds `u8 bump + 7 bytes padding + u64 counter`.
+
+**Instruction data** — exactly 2 bytes:
+- byte 0: discriminator (`0x01` for increment)
+- byte 1: bump byte
+
+**Exit codes**:
+- `0` — success, counter incremented
+- `1` — logical condition failed (PDA validation, signer check)
+- `2` — malformed instruction data
+- `3` — invalid account (not writable, etc.)
+
+## The constants block
+
+```asm title="src/counter/counter.s"
+.equ NUM_ACCOUNTS,          0x0000
+
+# account 0: owner (signer)
+.equ OWNER_HEADER,          0x0008
+.equ OWNER_KEY,             0x0010
+
+# account 1: counter PDA (writable)
+.equ COUNTER_HEADER,        0x2868
+.equ COUNTER_KEY,           0x2870
+.equ COUNTER_DATA,          0x28c0
+
+# instruction data: 2 bytes (discriminator + bump)
+.equ INSTRUCTION_DATA_LEN,  0x50c8
+.equ INSTRUCTION_DATA,      0x50d0
+
+# the program ID lives right after the 2-byte instruction data
+.equ PROGRAM_ID,            0x50d2
+```
+
+The math: each account block is `0x2860`. Two accounts puts `INSTRUCTION_DATA_LEN` at `0x0008 + 2 × 0x2860 = 0x50c8`. `INSTRUCTION_DATA` is 8 bytes later. `PROGRAM_ID` is `INSTRUCTION_DATA + 2` since ix data is 2 bytes.
+
+`COUNTER_DATA` is `COUNTER_HEADER + 0x58 = 0x2868 + 0x58 = 0x28c0`. Inside it, our layout puts the u64 counter at offset `+8` (the byte at `+0` is the bump, `+1..+8` is padding to align the u64).
+
+## The entrypoint
+
+We validate, dispatch on discriminator, and route to the only handler we've defined.
+
+```asm
+.globl entrypoint
+entrypoint:
+  mov64 r7, r1                       # save the input pointer; r1 will be reused
+
+  # validate exactly 2 bytes of instruction data
+  ldxdw r2, [r7 + INSTRUCTION_DATA_LEN]
+  jne r2, 2, bad_ix_data
+
+  # dispatch on the first byte
+  ldxb r4, [r7 + INSTRUCTION_DATA + 0]
+  jeq r4, 0x1, handler_increment
+  ja bad_ix_data
+```
+
+We park the input pointer in `r7` because PDA derivation and `sol_memcmp_` will both clobber `r1`-`r5`. The body code from here on reads input-region fields as `[r7 + OFFSET]` rather than `[r1 + OFFSET]`.
+
+## The increment handler
+
+The handler does six things, in order:
+
+1. Validate the owner is the signer.
+2. Validate the counter account is writable.
+3. Build the PDA seeds on the stack.
+4. Derive the PDA via `sol_create_program_address`.
+5. Compare the derived PDA against the passed-in counter account's pubkey.
+6. Read the counter, increment, write back.
+
+### Step 1: owner is signer
+
+```asm
+handler_increment:
+  ldxb r2, [r7 + OWNER_HEADER + 1]
+  jeq r2, 0, bad_signer
+```
+
+If the byte at `OWNER_HEADER + 1` (the `is_signer` flag) is zero, the owner did not sign and we refuse.
+
+### Step 2: counter account is writable
+
+```asm
+  ldxb r2, [r7 + COUNTER_HEADER + 2]
+  jeq r2, 0, bad_account
+```
+
+Same idea, different offset and flag. The counter account must be marked writable or the runtime will trap when we try to write to it.
+
+### Step 3: build the PDA seeds
+
+We need three seeds: the string `"counter"`, the owner's pubkey, and the bump byte.
+
+```asm
+  # park the bump byte in a stack slot we can point at
+  ldxb  r2, [r7 + INSTRUCTION_DATA + 1]
+  mov64 r9, r10
+  sub64 r9, 8
+  stxdw [r9 + 0], r2                       # bump byte (low byte is what matters)
+
+  # allocate the 48-byte SolBytes array (3 entries × 16 bytes)
+  mov64 r5, r9
+  sub64 r5, 48
+
+  # entry 0: pointer to "counter" in .rodata, length 7
+  lddw  r3, seed_counter
+  stxdw [r5 + 0], r3
+  lddw  r3, 7
+  stxdw [r5 + 8], r3
+
+  # entry 1: pointer to owner pubkey (in input region), length 32
+  mov64 r3, r7
+  add64 r3, OWNER_KEY
+  stxdw [r5 + 16], r3
+  lddw  r3, 32
+  stxdw [r5 + 24], r3
+
+  # entry 2: pointer to our bump byte on the stack, length 1
+  stxdw [r5 + 32], r9
+  lddw  r3, 1
+  stxdw [r5 + 40], r3
+```
+
+After this, `r5` points to a 48-byte `SolBytes` array. `r9` still points to the bump byte slot.
+
+### Step 4: derive the PDA
+
+```asm
+  # allocate the 32-byte output buffer just below the SolBytes array
+  mov64 r6, r5
+  sub64 r6, 32
+
+  mov64 r1, r5                             # seeds ptr
+  lddw  r2, 3                              # seed count
+  mov64 r3, r7
+  add64 r3, PROGRAM_ID                     # program ID ptr
+  mov64 r4, r6                             # output buffer
+  call sol_create_program_address
+```
+
+After the call, `r6` (callee-saved) still points to a 32-byte buffer containing the derived PDA. `r0 = 0` on success.
+
+### Step 5: compare derived PDA to passed-in counter
+
+```asm
+  # allocate a 4-byte result buffer just below the PDA buffer
+  mov64 r4, r6
+  sub64 r4, 4
+
+  mov64 r1, r6                             # derived PDA
+  mov64 r2, r7
+  add64 r2, COUNTER_KEY                    # account 1's pubkey
+  lddw  r3, 32
+  call sol_memcmp_
+
+  ldxw r2, [r4 + 0]
+  jne r2, 0, bad_pda                       # mismatch
+```
+
+Standard `sol_memcmp_` pattern: result lands as a u32 in the buffer at `r4`. Non-zero means the bytes differed.
+
+### Step 6: increment the counter
+
+```asm
+  # the counter u64 sits at COUNTER_DATA + 8 (padded past the bump byte)
+  ldxdw r2, [r7 + COUNTER_DATA + 8]
+  add64 r2, 1
+  stxdw [r7 + COUNTER_DATA + 8], r2
+
+  mov64 r0, 0
+  exit
+```
+
+Read, add one, write back. The counter is now updated and persists across invocations.
+
+## Error labels
+
+Standard layout at the bottom of the file: each error label logs once, sets `r0`, exits.
+
+```asm
+bad_ix_data:
+  lddw  r1, msg_bad_ix
+  mov64 r2, 13
+  call sol_log_
+  mov64 r0, 2
+  exit
+
+bad_signer:
+  lddw  r1, msg_bad_signer
+  mov64 r2, 14
+  call sol_log_
+  mov64 r0, 1
+  exit
+
+bad_pda:
+  lddw  r1, msg_bad_pda
+  mov64 r2, 7
+  call sol_log_
+  mov64 r0, 1
+  exit
+
+bad_account:
+  lddw  r1, msg_bad_account
+  mov64 r2, 11
+  call sol_log_
+  mov64 r0, 3
+  exit
+```
+
+## .rodata at the bottom
+
+```asm
+.rodata
+  seed_counter:    .ascii "counter"        # 7 bytes
+  msg_bad_ix:      .ascii "bad ix data\n"  # 13 bytes (12 visible + newline... 13 with the literal "\n")
+  msg_bad_signer:  .ascii "missing signer"  # 14 bytes
+  msg_bad_pda:     .ascii "bad pda"        # 7 bytes
+  msg_bad_account: .ascii "bad account"    # 11 bytes
+```
+
+Count the bytes of each string in your editor when you write them. The `mov64 r2, <len>` lines next to each `call sol_log_` must match.
+
+<Callout type="info">
+  The `\n` in `msg_bad_ix` is two characters in the source (`\` and `n`) which the assembler treats literally as those two bytes, not as a newline escape. If you want a real newline, count it as the source's two-character literal: `"bad ix data\n"` is 13 source-characters, all emitted as bytes. For ASCII messages without escapes, the byte count is just the character count.
+</Callout>
+
+## The complete file
+
+Pasting it all together:
+
+```asm title="src/counter/counter.s"
+.equ NUM_ACCOUNTS,          0x0000
+
+.equ OWNER_HEADER,          0x0008
+.equ OWNER_KEY,             0x0010
+
+.equ COUNTER_HEADER,        0x2868
+.equ COUNTER_KEY,           0x2870
+.equ COUNTER_DATA,          0x28c0
+
+.equ INSTRUCTION_DATA_LEN,  0x50c8
+.equ INSTRUCTION_DATA,      0x50d0
+.equ PROGRAM_ID,            0x50d2
+
+.globl entrypoint
+entrypoint:
+  mov64 r7, r1
+
+  ldxdw r2, [r7 + INSTRUCTION_DATA_LEN]
+  jne r2, 2, bad_ix_data
+
+  ldxb r4, [r7 + INSTRUCTION_DATA + 0]
+  jeq r4, 0x1, handler_increment
+  ja bad_ix_data
+
+handler_increment:
+  # owner must be signer
+  ldxb r2, [r7 + OWNER_HEADER + 1]
+  jeq r2, 0, bad_signer
+
+  # counter must be writable
+  ldxb r2, [r7 + COUNTER_HEADER + 2]
+  jeq r2, 0, bad_account
+
+  # park bump byte in a stack slot
+  ldxb  r2, [r7 + INSTRUCTION_DATA + 1]
+  mov64 r9, r10
+  sub64 r9, 8
+  stxdw [r9 + 0], r2
+
+  # build SolBytes[3]
+  mov64 r5, r9
+  sub64 r5, 48
+
+  lddw  r3, seed_counter
+  stxdw [r5 + 0], r3
+  lddw  r3, 7
+  stxdw [r5 + 8], r3
+
+  mov64 r3, r7
+  add64 r3, OWNER_KEY
+  stxdw [r5 + 16], r3
+  lddw  r3, 32
+  stxdw [r5 + 24], r3
+
+  stxdw [r5 + 32], r9
+  lddw  r3, 1
+  stxdw [r5 + 40], r3
+
+  # derive PDA
+  mov64 r6, r5
+  sub64 r6, 32
+
+  mov64 r1, r5
+  lddw  r2, 3
+  mov64 r3, r7
+  add64 r3, PROGRAM_ID
+  mov64 r4, r6
+  call sol_create_program_address
+
+  # compare against passed-in counter account
+  mov64 r4, r6
+  sub64 r4, 4
+
+  mov64 r1, r6
+  mov64 r2, r7
+  add64 r2, COUNTER_KEY
+  lddw  r3, 32
+  call sol_memcmp_
+
+  ldxw r2, [r4 + 0]
+  jne r2, 0, bad_pda
+
+  # increment counter at COUNTER_DATA + 8
+  ldxdw r2, [r7 + COUNTER_DATA + 8]
+  add64 r2, 1
+  stxdw [r7 + COUNTER_DATA + 8], r2
+
+  mov64 r0, 0
+  exit
+
+bad_ix_data:
+  lddw  r1, msg_bad_ix
+  mov64 r2, 13
+  call sol_log_
+  mov64 r0, 2
+  exit
+
+bad_signer:
+  lddw  r1, msg_bad_signer
+  mov64 r2, 14
+  call sol_log_
+  mov64 r0, 1
+  exit
+
+bad_pda:
+  lddw  r1, msg_bad_pda
+  mov64 r2, 7
+  call sol_log_
+  mov64 r0, 1
+  exit
+
+bad_account:
+  lddw  r1, msg_bad_account
+  mov64 r2, 11
+  call sol_log_
+  mov64 r0, 3
+  exit
+
+.rodata
+  seed_counter:    .ascii "counter"
+  msg_bad_ix:      .ascii "bad ix data\n"
+  msg_bad_signer:  .ascii "missing signer"
+  msg_bad_pda:     .ascii "bad pda"
+  msg_bad_account: .ascii "bad account"
+```
+
+About 90 lines. Build it with `sbpf build`. Deploy with `sbpf deploy counter`. Disassemble with `sbpf disassemble deploy/counter.so` and verify the output matches the source one-to-one.
+
+## What this leaves out
+
+For a production counter program you would also want:
+
+- **The init handler** from the previous chapter merged in as discriminator `0`, dispatched alongside the increment handler defined here.
+- **A close handler** that transfers the lamports out and zeros the data.
+- **Overflow handling** on the increment (decide whether to wrap, saturate, or fail at `u64::MAX`).
+- **Tests** in TypeScript that send the increment instruction with valid and invalid inputs and assert on the exit codes. The [Writing a Client](/docs/basics/client) chapter shows the test template.
+
+The shape of the increment handler is the template. Init follows the same shape with the CreateAccount CPI in place of the data write.
+
+## What to read next
+
+You have written a complete program. The next chapter, [Writing a Client](/docs/basics/client), shows how to call it from TypeScript: encoding instruction data, deriving the same PDA off-chain, signing and sending the transaction.

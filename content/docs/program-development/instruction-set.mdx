@@ -1,0 +1,106 @@
+---
+title: Instruction Set
+description: Every sBPF instruction this book uses, with syntax, operand types, and alignment rules.
+---
+
+Compact reference. For teaching-style introductions to these instructions, see [Assembly → Instructions](/docs/assembly/instructions).
+
+## Data movement
+
+| Mnemonic | Syntax | Semantics |
+|---|---|---|
+| `mov64` | `mov64 dst, src` | `dst = src` (src is register or 32-bit imm) |
+| `lddw` | `lddw rN, IMM` | `rN = IMM` (64-bit imm or label address; 16-byte instruction) |
+| `ldxb` | `ldxb rN, [base + off]` | read 1 byte (zero-extend) |
+| `ldxh` | `ldxh rN, [base + off]` | read 2 bytes (zero-extend) |
+| `ldxw` | `ldxw rN, [base + off]` | read 4 bytes (zero-extend) |
+| `ldxdw` | `ldxdw rN, [base + off]` | read 8 bytes |
+| `stxb` | `stxb [base + off], src` | write low 1 byte of src |
+| `stxh` | `stxh [base + off], src` | write low 2 bytes of src |
+| `stxw` | `stxw [base + off], src` | write low 4 bytes of src |
+| `stxdw` | `stxdw [base + off], src` | write 8 bytes of src |
+
+Memory addressing: `[base + offset]` where `base` is a register and `offset` is a signed 16-bit immediate (`-32768` to `+32767`). Operation must be naturally aligned for its size.
+
+## Arithmetic (64-bit)
+
+| Mnemonic | Syntax | Semantics |
+|---|---|---|
+| `add64` | `add64 dst, src` | `dst = dst + src` |
+| `sub64` | `sub64 dst, src` | `dst = dst - src` |
+| `mul64` | `mul64 dst, src` | `dst = dst * src` |
+| `div64` | `div64 dst, src` | `dst = dst / src` (unsigned) |
+| `sdiv64` | `sdiv64 dst, src` | `dst = dst / src` (signed) |
+| `mod64` | `mod64 dst, src` | `dst = dst % src` (unsigned) |
+| `and64` | `and64 dst, src` | bitwise AND |
+| `or64` | `or64 dst, src` | bitwise OR |
+| `xor64` | `xor64 dst, src` | bitwise XOR |
+| `lsh64` | `lsh64 dst, src` | `dst <<= src` (logical) |
+| `rsh64` | `rsh64 dst, src` | `dst >>= src` (logical) |
+| `arsh64` | `arsh64 dst, src` | `dst >>= src` (arithmetic, sign-extend) |
+| `neg64` | `neg64 dst` | `dst = -dst` |
+
+`src` can be a register or a 32-bit immediate.
+
+32-bit variants exist (drop the `64` suffix): operate on the low 32 bits and zero the upper 32. Almost never needed in Solana programs.
+
+## Control flow
+
+| Mnemonic | Syntax | Jumps if |
+|---|---|---|
+| `jeq` | `jeq dst, src, label` | `dst == src` |
+| `jne` | `jne dst, src, label` | `dst != src` |
+| `jgt` | `jgt dst, src, label` | `dst > src` (unsigned) |
+| `jge` | `jge dst, src, label` | `dst >= src` (unsigned) |
+| `jlt` | `jlt dst, src, label` | `dst < src` (unsigned) |
+| `jle` | `jle dst, src, label` | `dst <= src` (unsigned) |
+| `jsgt` | `jsgt dst, src, label` | `dst > src` (signed) |
+| `jsge` | `jsge dst, src, label` | `dst >= src` (signed) |
+| `jslt` | `jslt dst, src, label` | `dst < src` (signed) |
+| `jsle` | `jsle dst, src, label` | `dst <= src` (signed) |
+| `jset` | `jset dst, src, label` | `(dst & src) != 0` |
+| `ja` | `ja label` | unconditional |
+
+`dst` is always a register. `src` is a register or 32-bit immediate. Falls through on false.
+
+## Syscall and exit
+
+| Mnemonic | Syntax | Semantics |
+|---|---|---|
+| `call` | `call <name>` | invoke a runtime syscall; args in `r1`-`r5`, return in `r0`; clobbers `r1`-`r5`; preserves `r6`-`r9` |
+| `exit` | `exit` | end program; runtime reads exit code from `r0` |
+
+## Register conventions
+
+| Register | Role | Volatility across `call` |
+|---|---|---|
+| `r0` | exit code + syscall return value | clobbered |
+| `r1` | first syscall arg; on entry, input region pointer | clobbered |
+| `r2` | second syscall arg | clobbered |
+| `r3` | third syscall arg | clobbered |
+| `r4` | fourth syscall arg | clobbered |
+| `r5` | fifth syscall arg | clobbered |
+| `r6` | general purpose | preserved |
+| `r7` | general purpose | preserved |
+| `r8` | general purpose | preserved |
+| `r9` | general purpose | preserved |
+| `r10` | read-only stack pointer | preserved |
+
+## Encoding
+
+Every instruction is exactly 8 bytes, with one exception:
+
+- `lddw` is 16 bytes (it carries a 64-bit immediate).
+
+This means program size in bytes ≈ `instruction_count × 8` + `lddw_count × 8` extra.
+
+## Alignment rules
+
+| Operation size | Required address alignment |
+|---:|---|
+| 1 byte | any |
+| 2 bytes | 2-byte aligned |
+| 4 bytes | 4-byte aligned |
+| 8 bytes | 8-byte aligned |
+
+Misaligned access traps the runtime and aborts the transaction.

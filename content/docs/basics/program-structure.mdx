@@ -1,0 +1,235 @@
+---
+title: Program Structure
+description: The runtime interface, the input region layout, and the skeleton every sBPF program file shares.
+---
+
+import { Callout } from 'fumadocs-ui/components/callout';
+
+This chapter assumes you have read the **Assembly** section. We use `mov64`, `ldxdw`, `jne`, and the rest without re-introducing them. If anything looks unfamiliar, return to [Registers and Memory](/docs/assembly/registers-and-memory) or [Instructions](/docs/assembly/instructions) for the primer.
+
+By the end of this chapter you will understand: how the Solana runtime invokes your program, what shape every `.s` file shares, and how to read the input region the runtime hands you.
+
+## How the runtime invokes your program
+
+When a client submits a transaction containing an instruction for your program, the runtime does this before transferring control:
+
+1. It loads your program's ELF bytecode into the Program memory region.
+2. It locates the single global symbol named `entrypoint` in your ELF.
+3. It serialises the accounts, instruction data, and program ID into one contiguous buffer in the Input memory region.
+4. It writes the address of that buffer into register `r1`.
+5. It writes the address of the top of the stack into `r10`.
+6. It jumps to your `entrypoint`.
+
+At some point your program executes `exit`. The runtime reads `r0` and treats its value as the exit code. `r0 = 0` is success; anything else is failure.
+
+That is the entire interface. One pointer in, one integer out.
+
+## The smallest program that works
+
+A complete program in three lines:
+
+```asm title="src/example/example.s"
+.globl entrypoint
+entrypoint:
+  mov64 r0, 0
+  exit
+```
+
+- `.globl entrypoint` is an assembler directive (not an instruction) that exports the `entrypoint` symbol so the BPF Loader can find it.
+- `entrypoint:` is a label marking the address where execution starts.
+- `mov64 r0, 0` sets the exit code to success.
+- `exit` returns control to the runtime.
+
+This program does nothing observable. It compiles to about 600 bytes of ELF, runs in 1-2 compute units, and would be accepted by the BPF Loader. Every program in this book builds on this same frame.
+
+The Anchor equivalent:
+
+```rust
+#[program]
+pub mod example {
+  use super::*;
+  pub fn handler(_ctx: Context<Handler>) -> Result<()> { Ok(()) }
+}
+```
+
+Anchor expands this into hundreds of lines of generated code: entrypoint scaffolding, account deserialisers, dispatcher, error-to-exit-code conversion. The Anchor binary is 15-30 KB for the equivalent of those three asm lines. You are not paying for any of that in assembly.
+
+## The input region
+
+`r1` on entry points to a single contiguous buffer the runtime serialises before each invocation. The layout is fixed; you read any field by computing its offset and using `ldxdw` (or smaller variants) to load it.
+
+From the start:
+
+1. An 8-byte unsigned integer: the number of accounts the caller passed.
+2. The accounts themselves, one after another. Each non-duplicate account is exactly `0x2860` bytes (10336 decimal).
+3. An 8-byte unsigned integer: the length of the instruction data.
+4. The instruction data bytes.
+5. The 32-byte pubkey of the program being executed.
+
+### One account, byte by byte
+
+Inside each account's `0x2860`-byte block:
+
+| Offset (from account start) | Size | Field |
+|---:|---:|---|
+| `+0x00` | 1 byte | `dup_flag` (`0xff` for a fresh, unique account) |
+| `+0x01` | 1 byte | `is_signer` |
+| `+0x02` | 1 byte | `is_writable` |
+| `+0x03` | 1 byte | `is_executable` |
+| `+0x04` | 4 bytes | padding |
+| `+0x08` | 32 bytes | pubkey |
+| `+0x28` | 32 bytes | owner pubkey |
+| `+0x48` | 8 bytes | lamports |
+| `+0x50` | 8 bytes | data length (actual bytes used) |
+| `+0x58` | 10240 bytes | data + padding for growth |
+| `+0x2858` | 8 bytes | rent epoch |
+
+Add the sizes: `1+1+1+1+4+32+32+8+8+10240+8 = 10335`, plus one byte at the start, totals `10336` (`0x2860`).
+
+The 4-byte padding after the flags exists so the pubkey field is 8-byte aligned. The 10240-byte data slot exists so the runtime can grow data by up to `MAX_PERMITTED_DATA_INCREASE` bytes during the invocation without re-serialising.
+
+### Where the instruction data lives
+
+After the last account, the runtime writes the instruction data length and bytes, then the program ID. The offset of `INSTRUCTION_DATA_LEN` depends on how many accounts there are:
+
+| Accounts | `INSTRUCTION_DATA_LEN` | `INSTRUCTION_DATA` |
+|---:|---:|---:|
+| 0 | `0x0008` | `0x0010` |
+| 1 | `0x2868` | `0x2870` |
+| 2 | `0x50c8` | `0x50d0` |
+| 3 | `0x7928` | `0x7930` |
+
+The pattern: `INSTRUCTION_DATA_LEN = 0x0008 + N * 0x2860` for `N` accounts. The data bytes start 8 bytes later.
+
+<Callout type="info">
+  This is the single most important table in this chapter. Every program you write starts by reading `INSTRUCTION_DATA_LEN` at one of these offsets. The constants block in your `.s` file is shaped by the number of accounts you accept.
+</Callout>
+
+## Declaring offsets with `.equ`
+
+Reading raw hexadecimal offsets in the body becomes unreadable within minutes. The `.equ` directive declares a named constant; the assembler substitutes the value wherever the name appears.
+
+```asm title="constants block, top of file"
+.equ NUM_ACCOUNTS,         0x0000
+
+.equ ACCT0_HEADER,         0x0008
+.equ ACCT0_KEY,            0x0010
+.equ ACCT0_OWNER,          0x0030
+.equ ACCT0_LAMPORTS,       0x0050
+.equ ACCT0_DATA_LEN,       0x0058
+.equ ACCT0_DATA,           0x0060
+.equ ACCT0_RENT_EPOCH,     0x2860
+
+.equ INSTRUCTION_DATA_LEN, 0x2868
+.equ INSTRUCTION_DATA,     0x2870
+```
+
+Convention: `SCREAMING_CASE` for `.equ` names so they stand out from labels (`snake_case`) and registers (`r0`-`r10`). Prefix related offsets with the account name: `ACCT0_*` for fields of account 0, `ACCT1_*` for account 1.
+
+The body code reads only from these names, never from raw hex literals. Adding a second account means appending an `ACCT1_*` block at offsets shifted by `0x2860` and pushing `INSTRUCTION_DATA_LEN` down by the same amount. The body never changes.
+
+## Validating instruction data
+
+Validate the instruction data length before reading any of its bytes. If the caller passed 4 bytes when you expected 8, an unguarded `ldxdw [r1 + INSTRUCTION_DATA]` will read past the buffer into garbage or trap on alignment.
+
+```asm
+ldxdw r2, [r1 + INSTRUCTION_DATA_LEN]
+jne r2, 8, bad_ix_data
+```
+
+Two instructions, two compute units, catches most malformed input. If the length matches, execution falls through to the next instruction. We will define `bad_ix_data` at the bottom of the file as an error label.
+
+Validate first. Read second. Skipping this step is the most common source of out-of-bounds bugs in hand-written programs.
+
+## Dispatching on a discriminator
+
+Most programs handle more than one operation. The convention is to reserve the first byte of the instruction data as a **discriminator**: a small integer naming which operation the caller is invoking.
+
+```asm
+ldxb r4, [r1 + INSTRUCTION_DATA + 0]
+jeq r4, 0x0, handler_init
+jeq r4, 0x1, handler_increment
+jeq r4, 0x2, handler_close
+ja bad_ix_data
+```
+
+Each `jeq` compares against an immediate; if equal, jump to the matching handler. If none match, `ja` falls through to the error path.
+
+In Anchor, this dispatch happens automatically based on the names of your `pub fn` handlers (Anchor hashes each function name to a four-byte discriminator). In asm you write the dispatch by hand and choose the discriminator bytes yourself. This book picks its own throughout.
+
+## Returning a status
+
+The runtime treats `r0 = 0` as success. Anything else is failure: the runtime turns it into a `TransactionError::InstructionError { custom: r0 }` value the client sees. The runtime does not care what non-zero number you pick, but downstream clients will match on specific codes, so the choice is part of your program's public interface.
+
+This book uses one convention across every example:
+
+| `r0` value | Meaning |
+|---:|---|
+| `0` | Success |
+| `1` | A logical condition failed (balance too low, deadline missed, signature wrong) |
+| `2` | The instruction data was malformed |
+| `3` | An account was invalid (wrong owner, missing signer, wrong count) |
+
+Extend with domain-specific codes if you need them. Treat existing codes as stable once a program is in production; renumbering breaks downstream clients.
+
+<Callout type="warn">
+  There is no implicit zero in `r0`. If a code path ends in `exit` without first setting `r0`, the program returns whatever value happened to be left in `r0` from the previous instruction. Every `exit` in your file should be preceded by an explicit `mov64 r0, <code>`. No exceptions.
+</Callout>
+
+## Putting it together
+
+A complete program. One account, 9 bytes of instruction data (1-byte discriminator + 8-byte payload), two handler stubs.
+
+```asm title="src/example/example.s"
+.equ NUM_ACCOUNTS,         0x0000
+
+.equ ACCT0_HEADER,         0x0008
+.equ ACCT0_KEY,            0x0010
+.equ ACCT0_LAMPORTS,       0x0050
+.equ ACCT0_DATA_LEN,       0x0058
+.equ ACCT0_DATA,           0x0060
+
+.equ INSTRUCTION_DATA_LEN, 0x2868
+.equ INSTRUCTION_DATA,     0x2870
+
+.globl entrypoint
+entrypoint:
+  ldxdw r2, [r1 + INSTRUCTION_DATA_LEN]
+  jne r2, 9, bad_ix_data
+
+  ldxb r4, [r1 + INSTRUCTION_DATA + 0]
+  jeq r4, 0x0, handler_a
+  jeq r4, 0x1, handler_b
+  ja bad_ix_data
+
+handler_a:
+  mov64 r0, 0
+  exit
+
+handler_b:
+  mov64 r0, 0
+  exit
+
+bad_ix_data:
+  mov64 r0, 2
+  exit
+```
+
+Read this top to bottom and you can describe every line in plain English. The `.equ` block declares the offsets. The body validates the input length, reads the discriminator, dispatches to one of two handlers, each exits with explicit success. The fallback error label at the bottom exits with code 2.
+
+## The shape of every file in this book
+
+The structure above generalises to every program we write. From top to bottom of an `.s` file:
+
+1. The `.equ` constants block.
+2. The `.globl entrypoint` directive.
+3. The `entrypoint:` label and the body of the program.
+4. Each handler, in the order discriminators reference them. Each ends in its own `mov64 r0, <code>` and `exit`.
+5. The error labels. Each also ends in its own `exit`.
+6. The `.rodata` section, holding any string constants. (We will add this in the next chapter.)
+
+This structure is convention, not assembler enforcement. We follow it so a reader can predict where to look for what.
+
+## What to read next
+
+You can now describe the runtime interface, the input region layout, and the shape of a basic program. The next chapter, [Account Data](/docs/basics/account-data), shows how to do useful work with the accounts in the input region: read fields beyond the obvious pubkey, validate the caller, and write data back into accounts so it persists between invocations.
