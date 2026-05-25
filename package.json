@@ -10,6 +10,7 @@
     "prepare": "husky"
   },
   "dependencies": {
+    "@next/third-parties": "^16.2.6",
     "@takumi-rs/image-response": "^1.5.1",
     "fumadocs-core": "^16.0.0",
     "fumadocs-mdx": "^15.0.0",
