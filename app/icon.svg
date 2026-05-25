@@ -1,0 +1,6 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 180 180"><metadata><rdf:RDF xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:dc="http://purl.org/dc/elements/1.1/"><rdf:Description><dc:creator>RealFaviconGenerator</dc:creator><dc:source>https://realfavicongenerator.net</dc:source></rdf:Description></rdf:RDF></metadata><defs>
+    <linearGradient id="logo-iconGradient" gradientTransform="rotate(45)">
+      <stop offset="45%" stop-color="#0B0E14"></stop>
+      <stop offset="100%" stop-color="#00FFFF"></stop>
+    </linearGradient>
+  </defs><circle cx="90" cy="90" r="89" fill="url(#logo-iconGradient)" stroke="#00FFFF" stroke-width="1"></circle></svg>

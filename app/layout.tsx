@@ -13,6 +13,7 @@ export const metadata = createMetadata({
   },
   description: 'Patterns and idioms for writing Solana programs in pure assembly.',
   metadataBase: baseUrl,
+  manifest: '/manifest.webmanifest',
 });
 
 const geist = Geist({
