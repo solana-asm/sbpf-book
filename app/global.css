@@ -5,14 +5,38 @@
 @theme inline {
   --default-font-family: var(--font-sans);
   --default-mono-font-family: var(--font-mono);
+
+  /* brand tokens */
+  --color-brand-primary: #00FFFF;
+  --color-brand-invert: #007070;
 }
 
-:root {
-  --color-fd-primary: hsl(45, 95%, 45%);
-}
-
+/* dark theme is the only theme */
+:root,
 .dark {
-  --color-fd-primary: #fff383;
+  --color-fd-primary: #00FFFF;
+  --color-fd-primary-foreground: #0B0E14;
+
+  --color-fd-background: #0B0E14;
+  --color-fd-foreground: #EFF1F6;
+
+  --color-fd-card: #11141A;
+  --color-fd-card-foreground: #EFF1F6;
+
+  --color-fd-popover: #11141A;
+  --color-fd-popover-foreground: #EFF1F6;
+
+  --color-fd-muted: #11141A;
+  --color-fd-muted-foreground: #ADB9D2;
+
+  --color-fd-secondary: #11141A;
+  --color-fd-secondary-foreground: #EFF1F6;
+
+  --color-fd-accent: #11141A;
+  --color-fd-accent-foreground: #EFF1F6;
+
+  --color-fd-border: #11141A;
+  --color-fd-ring: #00FFFF;
 }
 
 html {

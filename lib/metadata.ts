@@ -1,4 +1,7 @@
 import type { Metadata } from 'next/types';
+import type { source } from '@/lib/source';
+
+type Page = ReturnType<typeof source.getPage>;
 
 export function createMetadata(override: Metadata): Metadata {
   return {
@@ -18,7 +21,15 @@ export function createMetadata(override: Metadata): Metadata {
   };
 }
 
+export function getPageImage(page: NonNullable<Page>) {
+  const segments = [...page.slugs, 'image.png'];
+  return {
+    segments,
+    url: `/og/${segments.join('/')}`,
+  };
+}
+
 export const baseUrl =
-  process.env.NODE_ENV === 'development' || !process.env.VERCEL_PROJECT_PRODUCTION_URL
+  process.env.NODE_ENV === 'development'
     ? new URL('http://localhost:3000')
-    : new URL(`https://${process.env.VERCEL_PROJECT_PRODUCTION_URL}`);
+    : new URL('https://sbpf.dev');

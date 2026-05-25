@@ -1,0 +1,10 @@
+<svg width="1080" height="1080" viewBox="0 0 1080 1080" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="logo-iconGradient" gradientTransform="rotate(45)">
+      <stop offset="45%" stop-color="#0B0E14" />
+      <stop offset="100%" stop-color="#00FFFF" />
+    </linearGradient>
+  </defs>
+  <rect width="1080" height="1080" fill="#0B0E14" />
+  <circle cx="540" cy="540" r="380" fill="url(#logo-iconGradient)" stroke="#00FFFF" stroke-width="4" />
+</svg>

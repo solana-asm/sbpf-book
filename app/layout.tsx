@@ -26,17 +26,14 @@ const mono = JetBrains_Mono({
 });
 
 export const viewport: Viewport = {
-  themeColor: [
-    { media: '(prefers-color-scheme: dark)', color: '#0A0A0A' },
-    { media: '(prefers-color-scheme: light)', color: '#fff' },
-  ],
+  themeColor: '#0B0E14',
 };
 
 export default function RootLayout({ children }: { children: ReactNode }) {
   return (
     <html
       lang="en"
-      className={`${geist.variable} ${mono.variable}`}
+      className={`dark ${geist.variable} ${mono.variable}`}
       suppressHydrationWarning
     >
       <body className="flex flex-col min-h-screen">

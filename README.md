@@ -5,7 +5,6 @@
   </p>
   <p>
     <a href="https://github.com/solana-asm/sbpf-book/blob/main/LICENSE"><img alt="MIT License" src="https://img.shields.io/badge/license-MIT-blueviolet" /></a>
-    <a href="https://github.com/solana-asm/sbpf-book/issues"><img alt="Issues" src="https://img.shields.io/github/issues/solana-asm/sbpf-book?color=blueviolet" /></a>
   </p>
 </div>
 
@@ -15,7 +14,7 @@ You reach for sBPF assembly when audit clarity, sub-kilobyte binaries, byte-exac
 
 ## Read it
 
-Live site: [`sbpf-book`](https://sbpf-book.vercel.app) (or wherever the deployed URL points).
+Live site: **[sbpf.dev](https://sbpf.dev)**.
 
 ## What's inside
 
