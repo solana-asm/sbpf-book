@@ -5,6 +5,7 @@ import { Geist, JetBrains_Mono } from 'next/font/google';
 import { NextProvider } from 'fumadocs-core/framework/next';
 import { baseUrl, createMetadata } from '@/lib/metadata';
 import { Provider } from './provider';
+import { Analytics } from '@/components/analytics';
 
 export const metadata = createMetadata({
   title: {
@@ -41,6 +42,7 @@ export default function RootLayout({ children }: { children: ReactNode }) {
         <NextProvider>
           <Provider>{children}</Provider>
         </NextProvider>
+        <Analytics />
       </body>
     </html>
   );

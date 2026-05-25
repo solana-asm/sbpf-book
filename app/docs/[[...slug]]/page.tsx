@@ -4,6 +4,8 @@ import {
   DocsDescription,
   DocsPage,
   DocsTitle,
+  MarkdownCopyButton,
+  ViewOptionsPopover,
 } from 'fumadocs-ui/layouts/docs/page';
 import { notFound } from 'next/navigation';
 import { getMDXComponents } from '@/components/mdx';
@@ -31,6 +33,15 @@ export default async function Page(props: PageProps<'/docs/[[...slug]]'>) {
     >
       <DocsTitle>{page.data.title}</DocsTitle>
       <DocsDescription>{page.data.description}</DocsDescription>
+
+      <div className="flex flex-row flex-wrap items-center gap-2 border-b border-fd-border pb-6">
+        <MarkdownCopyButton markdownUrl={`${page.url}.mdx`} />
+        <ViewOptionsPopover
+          markdownUrl={`${page.url}.mdx`}
+          githubUrl={`https://github.com/solana-asm/sbpf-book/blob/main/content/docs/${page.path}`}
+        />
+      </div>
+
       <DocsBody>
         <MDX
           components={getMDXComponents({
