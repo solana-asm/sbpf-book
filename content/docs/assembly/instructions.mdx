@@ -37,6 +37,10 @@ lddw r1, message              # r1 = address of the label "message"
 lddw r3, 0x1234567890abcdef   # r3 = a 64-bit constant
 ```
 
+<Callout type="info">
+  Despite the name, `lddw` is not actually a load: there is no memory operand and the runtime touches no memory. It is the 64-bit counterpart to `mov64`. The 16-byte encoding exists solely to fit a 64-bit immediate (an 8-byte instruction only has room for 32 bits of immediate). The historical eBPF name stuck; the behaviour is `rN = IMM`.
+</Callout>
+
 ### Loads from memory: `ldxb`, `ldxh`, `ldxw`, `ldxdw`
 
 These read bytes from a memory address into a register. The suffix names the size.
@@ -127,8 +131,16 @@ Unlike x86 or ARM, sBPF does not have a separate compare instruction followed by
 | `jge dst, src, label` | Jump to `label` if `dst >= src` (unsigned) |
 | `jlt dst, src, label` | Jump to `label` if `dst < src` (unsigned) |
 | `jle dst, src, label` | Jump to `label` if `dst <= src` (unsigned) |
+| `jset dst, src, label` | Jump to `label` if `(dst & src) != 0` (bit test) |
 
 `dst` is always a register. `src` can be a register or an immediate.
+
+`jset` is the odd one out: it does not compare `dst` against `src`, it ANDs them and jumps if any bit survives. The natural use is checking a flag bit without an extra `and64` and `jne`:
+
+```asm
+jset r2, 0x1, is_signer        # jump if bit 0 of r2 is set
+jset r3, 0x80, high_bit_set    # jump if the high bit of the low byte is set
+```
 
 ```asm
 jne r2, 8, bad_ix_data       # if r2 != 8 goto bad_ix_data
@@ -179,6 +191,20 @@ exit
 
 There is no implicit `exit`. If execution flows past the last instruction in your program, the runtime traps with an out-of-bounds error. Every path through your program must end in an explicit `exit`.
 
+## What this chapter does not cover
+
+A handful of instructions exist in the full ISA that you will essentially never write by hand:
+
+- **Endian byte-swaps**: `le16`, `le32`, `le64`, `be16`, `be32`, `be64`. Solana is little-endian, so `le{n}` reduces to masking the low `n` bits (the bytes are already in the right order). Only `be{n}` performs a real byte swap. Reach for `be{n}` when you need to interoperate with a network-order format and not otherwise.
+- **32-bit ALU variants**: `add`, `sub`, `mul`, etc. without the `64` suffix. They zero the upper 32 bits of the destination, which is rarely what you want when every value of interest is a 64-bit u64 or pointer.
+- **Atomics**: `xadd`, `xchg`, and friends. The runtime is single-threaded per program invocation; atomicity is automatic. No reason to emit these.
+
+If you see one of these in a disassembly you did not write, consult the [opcode reference](/docs/program-development/instruction-set) and the [bpf.wtf ISA writeup](https://bpf.wtf/sol-0x03-isa).
+
+<Callout type="warn">
+  Three assembler dialects emit slightly different syntax for the same opcodes: the `sbpf` toolchain (this book's), Capstone (used by Solana Explorer), and LLVM. Mnemonics differ in minor ways (`mov64` vs `mov`, register-source vs immediate-source disambiguation). The opcode bytes are identical; if you copy a snippet from one dialect into another, fix the syntax and re-assemble.
+</Callout>
+
 ## Instruction summary
 
 | Mnemonic | Family | Purpose |
@@ -189,6 +215,7 @@ There is no implicit `exit`. If execution flows past the last instruction in you
 | `add64`, `sub64`, `mul64`, `div64`, `sdiv64` | arithmetic | integer math |
 | `and64`, `or64`, `xor64`, `lsh64`, `rsh64`, `arsh64` | arithmetic | bitwise |
 | `jeq`, `jne`, `jgt`, `jge`, `jlt`, `jle` (and `s` variants) | control flow | conditional jumps |
+| `jset` | control flow | bit-test jump |
 | `ja` | control flow | unconditional jump |
 | `call` | syscall | invoke a runtime-provided syscall |
 | `exit` | control flow | end program, return `r0` |

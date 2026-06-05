@@ -5,40 +5,42 @@ description: Every sBPF instruction this book uses, with syntax, operand types, 
 
 Compact reference. For teaching-style introductions to these instructions, see [Assembly → Instructions](/docs/assembly/instructions).
 
+The **Opcode** column is the byte the assembler emits for each instruction. Read it when staring at a disassembly or debugging an unfamiliar binary. Two entries per ALU and jump instruction reflect the two source modes: the lower opcode is the immediate-source form, the higher one is the register-source form.
+
 ## Data movement
 
-| Mnemonic | Syntax | Semantics |
-|---|---|---|
-| `mov64` | `mov64 dst, src` | `dst = src` (src is register or 32-bit imm) |
-| `lddw` | `lddw rN, IMM` | `rN = IMM` (64-bit imm or label address; 16-byte instruction) |
-| `ldxb` | `ldxb rN, [base + off]` | read 1 byte (zero-extend) |
-| `ldxh` | `ldxh rN, [base + off]` | read 2 bytes (zero-extend) |
-| `ldxw` | `ldxw rN, [base + off]` | read 4 bytes (zero-extend) |
-| `ldxdw` | `ldxdw rN, [base + off]` | read 8 bytes |
-| `stxb` | `stxb [base + off], src` | write low 1 byte of src |
-| `stxh` | `stxh [base + off], src` | write low 2 bytes of src |
-| `stxw` | `stxw [base + off], src` | write low 4 bytes of src |
-| `stxdw` | `stxdw [base + off], src` | write 8 bytes of src |
+| Mnemonic | Opcode | Syntax | Semantics |
+|---|---|---|---|
+| `mov64` | `0xb7` / `0xbf` | `mov64 dst, src` | `dst = src` (src is register or 32-bit imm) |
+| `lddw` | `0x18` | `lddw rN, IMM` | `rN = IMM` (64-bit imm or label address; 16-byte instruction) |
+| `ldxb` | `0x71` | `ldxb rN, [base + off]` | read 1 byte (zero-extend) |
+| `ldxh` | `0x69` | `ldxh rN, [base + off]` | read 2 bytes (zero-extend) |
+| `ldxw` | `0x61` | `ldxw rN, [base + off]` | read 4 bytes (zero-extend) |
+| `ldxdw` | `0x79` | `ldxdw rN, [base + off]` | read 8 bytes |
+| `stxb` | `0x73` | `stxb [base + off], src` | write low 1 byte of src |
+| `stxh` | `0x6b` | `stxh [base + off], src` | write low 2 bytes of src |
+| `stxw` | `0x63` | `stxw [base + off], src` | write low 4 bytes of src |
+| `stxdw` | `0x7b` | `stxdw [base + off], src` | write 8 bytes of src |
 
 Memory addressing: `[base + offset]` where `base` is a register and `offset` is a signed 16-bit immediate (`-32768` to `+32767`). Operation must be naturally aligned for its size.
 
 ## Arithmetic (64-bit)
 
-| Mnemonic | Syntax | Semantics |
-|---|---|---|
-| `add64` | `add64 dst, src` | `dst = dst + src` |
-| `sub64` | `sub64 dst, src` | `dst = dst - src` |
-| `mul64` | `mul64 dst, src` | `dst = dst * src` |
-| `div64` | `div64 dst, src` | `dst = dst / src` (unsigned) |
-| `sdiv64` | `sdiv64 dst, src` | `dst = dst / src` (signed) |
-| `mod64` | `mod64 dst, src` | `dst = dst % src` (unsigned) |
-| `and64` | `and64 dst, src` | bitwise AND |
-| `or64` | `or64 dst, src` | bitwise OR |
-| `xor64` | `xor64 dst, src` | bitwise XOR |
-| `lsh64` | `lsh64 dst, src` | `dst <<= src` (logical) |
-| `rsh64` | `rsh64 dst, src` | `dst >>= src` (logical) |
-| `arsh64` | `arsh64 dst, src` | `dst >>= src` (arithmetic, sign-extend) |
-| `neg64` | `neg64 dst` | `dst = -dst` |
+| Mnemonic | Opcode | Syntax | Semantics |
+|---|---|---|---|
+| `add64` | `0x07` / `0x0f` | `add64 dst, src` | `dst = dst + src` |
+| `sub64` | `0x17` / `0x1f` | `sub64 dst, src` | `dst = dst - src` |
+| `mul64` | `0x27` / `0x2f` | `mul64 dst, src` | `dst = dst * src` |
+| `div64` | `0x37` / `0x3f` | `div64 dst, src` | `dst = dst / src` (unsigned) |
+| `sdiv64` | `0xe7` / `0xef` | `sdiv64 dst, src` | `dst = dst / src` (signed) |
+| `mod64` | `0x97` / `0x9f` | `mod64 dst, src` | `dst = dst % src` (unsigned) |
+| `and64` | `0x57` / `0x5f` | `and64 dst, src` | bitwise AND |
+| `or64` | `0x47` / `0x4f` | `or64 dst, src` | bitwise OR |
+| `xor64` | `0xa7` / `0xaf` | `xor64 dst, src` | bitwise XOR |
+| `lsh64` | `0x67` / `0x6f` | `lsh64 dst, src` | `dst <<= src` (logical) |
+| `rsh64` | `0x77` / `0x7f` | `rsh64 dst, src` | `dst >>= src` (logical) |
+| `arsh64` | `0xc7` / `0xcf` | `arsh64 dst, src` | `dst >>= src` (arithmetic, sign-extend) |
+| `neg64` | `0x87` | `neg64 dst` | `dst = -dst` |
 
 `src` can be a register or a 32-bit immediate.
 
@@ -46,29 +48,38 @@ Memory addressing: `[base + offset]` where `base` is a register and `offset` is 
 
 ## Control flow
 
-| Mnemonic | Syntax | Jumps if |
-|---|---|---|
-| `jeq` | `jeq dst, src, label` | `dst == src` |
-| `jne` | `jne dst, src, label` | `dst != src` |
-| `jgt` | `jgt dst, src, label` | `dst > src` (unsigned) |
-| `jge` | `jge dst, src, label` | `dst >= src` (unsigned) |
-| `jlt` | `jlt dst, src, label` | `dst < src` (unsigned) |
-| `jle` | `jle dst, src, label` | `dst <= src` (unsigned) |
-| `jsgt` | `jsgt dst, src, label` | `dst > src` (signed) |
-| `jsge` | `jsge dst, src, label` | `dst >= src` (signed) |
-| `jslt` | `jslt dst, src, label` | `dst < src` (signed) |
-| `jsle` | `jsle dst, src, label` | `dst <= src` (signed) |
-| `jset` | `jset dst, src, label` | `(dst & src) != 0` |
-| `ja` | `ja label` | unconditional |
+| Mnemonic | Opcode | Syntax | Jumps if |
+|---|---|---|---|
+| `jeq` | `0x15` / `0x1d` | `jeq dst, src, label` | `dst == src` |
+| `jne` | `0x55` / `0x5d` | `jne dst, src, label` | `dst != src` |
+| `jgt` | `0x25` / `0x2d` | `jgt dst, src, label` | `dst > src` (unsigned) |
+| `jge` | `0x35` / `0x3d` | `jge dst, src, label` | `dst >= src` (unsigned) |
+| `jlt` | `0xa5` / `0xad` | `jlt dst, src, label` | `dst < src` (unsigned) |
+| `jle` | `0xb5` / `0xbd` | `jle dst, src, label` | `dst <= src` (unsigned) |
+| `jsgt` | `0x65` / `0x6d` | `jsgt dst, src, label` | `dst > src` (signed) |
+| `jsge` | `0x75` / `0x7d` | `jsge dst, src, label` | `dst >= src` (signed) |
+| `jslt` | `0xc5` / `0xcd` | `jslt dst, src, label` | `dst < src` (signed) |
+| `jsle` | `0xd5` / `0xdd` | `jsle dst, src, label` | `dst <= src` (signed) |
+| `jset` | `0x45` / `0x4d` | `jset dst, src, label` | `(dst & src) != 0` |
+| `ja` | `0x05` | `ja label` | unconditional |
 
 `dst` is always a register. `src` is a register or 32-bit immediate. Falls through on false.
 
 ## Syscall and exit
 
-| Mnemonic | Syntax | Semantics |
-|---|---|---|
-| `call` | `call <name>` | invoke a runtime syscall; args in `r1`-`r5`, return in `r0`; clobbers `r1`-`r5`; preserves `r6`-`r9` |
-| `exit` | `exit` | end program; runtime reads exit code from `r0` |
+| Mnemonic | Opcode | Syntax | Semantics |
+|---|---|---|---|
+| `call` | `0x85` | `call <name>` | invoke a runtime syscall; args in `r1`-`r5`, return in `r0`; clobbers `r1`-`r5`; preserves `r6`-`r9` |
+| `exit` | `0x95` | `exit` | end program; runtime reads exit code from `r0` |
+
+## Endian (`le` / `be`)
+
+| Mnemonic | Opcode | Syntax | Semantics |
+|---|---|---|---|
+| `le` | `0xd4` | `le16 dst` / `le32 dst` / `le64 dst` | byte-swap to little-endian; on Solana this is a mask, not a swap |
+| `be` | `0xdc` | `be16 dst` / `be32 dst` / `be64 dst` | byte-swap to big-endian; this is the only direction that actually swaps |
+
+Solana runs little-endian, so `le{n}` reduces to masking the low `n` bits. Use `be{n}` when you genuinely need network-order bytes (parsing certain external formats); skip these otherwise.
 
 ## Register conventions
 

@@ -6,6 +6,7 @@
     "syscalls",
     "compute-units",
     "security-pitfalls",
-    "example-programs"
+    "example-programs",
+    "resources"
   ]
 }

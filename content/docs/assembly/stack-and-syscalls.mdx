@@ -206,6 +206,45 @@ condition_failed:
 
 Used at the bottom of every program to emit a human-readable error before failing the transaction. The string lives in `.rodata`; `lddw` loads its address; `r2` carries the byte length.
 
+### Pattern 4: a loop with an accumulator
+
+sBPF has no `for` or `while`. A loop is a label, a body that updates one or more registers, and a conditional jump back to the label. The whole pattern is three pieces: initialise the loop state in callee-saved registers, body, branch.
+
+This example computes the `n`-th Fibonacci number with `n` taken from the first 8 bytes of instruction data. `r6` holds the iteration counter, `r7` holds `F(i-1)`, `r8` holds `F(i)`. Everything stays in `r6` to `r9` so no syscall could clobber it.
+
+```asm title="iterative fibonacci"
+ldxdw r6, [r1 + INSTRUCTION_DATA]   # n
+jeq r6, 0, return_zero              # F(0) = 0
+mov64 r7, 0                         # prev = 0
+mov64 r8, 1                         # curr = 1
+mov64 r9, 1                         # i = 1
+
+loop:
+  jeq r9, r6, done                  # if i == n exit the loop
+  mov64 r2, r7
+  add64 r2, r8                      # next = prev + curr
+  mov64 r7, r8                      # prev = curr
+  mov64 r8, r2                      # curr = next
+  add64 r9, 1                       # i += 1
+  ja loop
+
+done:
+  mov64 r0, r8
+  exit
+
+return_zero:
+  mov64 r0, 0
+  exit
+```
+
+Three things to read off this:
+
+1. **Loop state lives in callee-saved registers.** Even though this loop calls no syscalls, the convention pays off the moment you want to log or check a sysvar inside the body. Switch the registers later and the body breaks; pick them right the first time.
+2. **One conditional jump per iteration.** `jeq r9, r6, done` is the exit check; `ja loop` is the back-edge. The body in between is straight-line code, which is the easiest shape to reason about and to budget for compute units.
+3. **CU cost is linear.** This loop runs the four-instruction body plus the two-instruction control overhead `n - 1` times. Roughly `6n + setup` compute units. The straight-line equivalent for a known small `n` would be a few CU cheaper but immobile; the loop trades one extra CU per iteration for arbitrary `n`.
+
+The same shape (init in `r6` to `r9`, body, conditional back-edge) generalises to "scan an account's bytes for a delimiter", "iterate a fixed-length seed array for PDA derivation", or "process `n` instruction-data records." Once you have it, you have all of looping in sBPF.
+
 ## What to read next
 
 You now have the full assembly vocabulary: registers, memory, instructions, the stack, and syscalls. The next section, **Core Concepts**, applies these to the actual problem of writing a Solana program. The first chapter, [Program Structure](/docs/basics/program-structure), covers the runtime interface: what the input region holds, how to declare offsets, and how to dispatch on instruction discriminators.

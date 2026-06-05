@@ -7,6 +7,18 @@ Every syscall is invoked with `call <name>`. Arguments live in `r1` through `r5`
 
 All syscall names below are resolved by the sBPF assembler against the runtime's syscall table.
 
+## How dispatch actually works
+
+The assembler does not embed the name in the instruction. The `call` opcode (`0x85`) carries a 32-bit immediate, and the assembler fills it with the Murmur3 hash of the syscall name. At program load, the runtime resolves the hash against an immutable registry of built-in functions; an unknown hash fails verification before the program runs. This is why you cannot define your own `name:` label and reach it with `call name` syntax: the registry is fixed, and any hash that does not appear in it is rejected.
+
+A practical consequence when reading disassembly: a `call` whose immediate looks like a meaningless 32-bit number (e.g. `0x207559bd`) is the Murmur3 hash of a syscall name (`sol_log_` in that case). The dasmac and bpf.wtf syscall references list the hashes if you need to invert one by hand.
+
+## Why `r6` to `r9` survive a syscall
+
+The BPF VM does not allocate a call frame when dispatching a syscall. There is no register save area, no spill, no implicit push or pop. Your `r1` to `r5` are handed to the syscall as is; the syscall writes its return into `r0` and returns; `r6` to `r9` and `r10` are untouched because nothing ever touches them.
+
+This is the invariant behind the calling convention. The rule "park values you need past a `call` in `r6` to `r9`" is not a contract the syscall promises to honour, it is a consequence of frameless dispatch. A syscall does not "preserve" `r6` to `r9` so much as it has no mechanism to disturb them.
+
 ## Logging
 
 ### `sol_log_`

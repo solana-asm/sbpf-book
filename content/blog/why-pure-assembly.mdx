@@ -1,0 +1,76 @@
+---
+title: "Why we wrote Shield in pure sBPF assembly"
+description: "Anchor and Pinocchio are good defaults until you are writing a 7-CU program. At that point the framework is most of the binary. Notes from rewriting the Shield guards out of Rust and into raw .s files."
+date: "2026-06-05"
+author: "Priyansh Patel"
+tags: ["sbpf", "assembly", "shield", "compute-units"]
+---
+
+The first version of [`slippage`](https://github.com/solana-asm/shield/blob/main/src/slippage/slippage.s) was an Anchor program. It compiled to 41kb. It cost 1,432 CU. It did one thing: read a u64 at byte 64 of an SPL Token account, compare it to a u64 from instruction data, return non-zero if the actual was less than the floor.
+
+The current version is 312 bytes and 7 CU. There is no Anchor, no Pinocchio, no Rust runtime. The file is 41 lines of sBPF assembly.
+
+This post is about why that gap exists, and why we kept walking down it for every guard in Shield.
+
+## Where the bytes go
+
+When you write `#[program] pub mod slippage { ... }`, you do not get a program that reads a u64 and compares. You get a program that links in:
+
+- the Anchor dispatch table (an 8-byte discriminator on the first instruction word, plus a match on every defined ix name)
+- the standard `Accounts` validator (every account checked for owner, lamports, rent epoch, data length)
+- `try_serialize` and `try_deserialize` for the account types you touched
+- `entrypoint!`'s deserialization of `&[u8]` into `(&Pubkey, &[AccountInfo], &[u8])`
+- `solana_program`'s panic handler, allocator stub, and syscall shims
+
+Each of these is the right default for a program that does many things, because amortized across a real codebase the framework tax is dominated by the logic. For a program whose entire body is "compare two u64s", the tax is the program.
+
+The same thing is true on the CU axis. The Anchor dispatch alone is ~600 CU before any of your code runs. The `Accounts` validator adds another few hundred. The deserialization of the SPL Token account into `Account` (not the raw bytes you actually wanted) costs more. By the time your `>=` check runs, you are already over 1k CU.
+
+## What you actually need
+
+For `slippage` specifically, the requirements are:
+
+- Read the u64 at offset 64 of the SPL Token account's data region.
+- Read the u64 at offset 0 of instruction data.
+- Compare. If the account value is less than the data value, log a string and return 1. Otherwise return 0.
+
+In sBPF, the loader hands you the input layout at register `r1`. The first account's data starts at a fixed offset (`r1 + 0xA0` for an aligned account with header), so `ldxdw r2, [r1 + 0xA0 + 64]` reads the token amount. Instruction data length lives at `r1 + 0x2910` (the offset shifts with `account[0].data.len()`, which is one of the things [the sBPF book](/docs) tries to demystify), and instruction data itself follows. One more `ldxdw` for `min_amount`, one `jlt` for the compare, one `exit`. Done.
+
+The whole guard is a function of position. There is no parsing because the layout is already deterministic, no syscall because the data we need is already mapped into memory, no allocation because we never write anywhere.
+
+## When the tradeoff inverts
+
+Pure assembly is not free. You give up:
+
+- type safety on instruction data (you are reading raw bytes, the compiler cannot check that 8 bytes is actually a u64)
+- structured errors (you log a short string and return a small integer, no `ProgramError` enum)
+- the IDL (no client codegen, you handwrite the `TransactionInstruction` builder)
+- portability across loader versions (the layout offsets are tied to the aligned loader)
+
+For a generic on-chain program with multiple instructions, evolving state, and human callers, every one of those is worth more than a few kilobytes and a few hundred CU. The right tool is Anchor or Pinocchio.
+
+For a program that is one stateless yes/no check, prepended to other people's transactions thousands of times a day, the inversion is sharp. Smaller binaries deploy faster, fit into more compose patterns, and reduce the surface area an auditor has to reason about. Sub-100 CU per guard means you can stack four of them in front of a swap and the user does not notice in either fee or latency.
+
+## How we got the numbers down
+
+The Shield guards landed at their final CU after a few rounds of:
+
+1. Read the disassembly. `cargo install sbpf` ships with a disassembler; `sbpf dump deploy/slippage.so` shows the exact instructions and their CU cost.
+2. Remove anything we did not need. The first slippage rewrite still loaded `program_id` into a register out of habit. We did not use it. Deleting that load saved 1 CU and 8 bytes.
+3. Replace syscalls with memory reads where possible. `sol_log_pubkey` is a syscall. `sol_log_` of a static string is also a syscall but costs less. Comparing pubkeys without logging them costs nothing at all.
+4. Inline everything. There are no helper functions in the guards. Each guard is one straight-line program with one branch.
+
+The reference for input layout offsets, syscall helper IDs, and the dispatch idioms used here lives in the [Assembly section of the sBPF book](/docs/assembly). The book exists because there is no canonical reference for this, and we want the next person to skip the disassembly archaeology.
+
+## When the inversion is worth it
+
+The inversion is not as rare as it sounds. p-token, the Pinocchio-based SPL Token rewrite, lands transfer at ~155 CU against SPL Token's ~4,645. That gap compounds across every protocol that touches the token program. The cases where assembly earns its weight are similar in shape:
+
+- **Hot paths called millions of times.** Token programs, oracle adapters, DEX inner instructions. Every CU compounds across the protocol that builds on top.
+- **Binaries small enough to compose freely.** A 41kb guard is impractical to prepend to other people's transactions. A 400-byte one is forgettable.
+- **Audit clarity over developer ergonomics.** A few hundred lines of assembly is an afternoon of reading. The expanded Anchor equivalent is hundreds of macro invocations, runtime initializers, and indirect calls before the logic starts.
+- **Stateless or near-stateless programs.** When you do not need account creation, IDL, structured errors, or upgrade paths, the Rust runtime is paying for things you never use.
+
+Shield ticks all four. Most production Solana programs tick at least one. If yours does, [the book](/docs) exists so the next person does not have to redo the disassembly archaeology we did.
+
+The full set of guards, source, and benchmarks: [github.com/solana-asm/shield](https://github.com/solana-asm/shield).

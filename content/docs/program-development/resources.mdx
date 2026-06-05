@@ -1,0 +1,50 @@
+---
+title: Resources
+description: External references, tools, and example repos worth reading alongside this book.
+---
+
+This book is opinionated and aimed at one path through sBPF: validate, mutate, CPI, exit. The materials below cover the rest of the territory: bytecode specifications, runtime internals, alternative pedagogies, and the tools you reach for past the basics. Treat this page as a map; nothing here is required reading to follow the book.
+
+## ISA references
+
+Authoritative sources for the instruction set itself, including encoding details this book does not reproduce.
+
+- [bpf.wtf 0x03: the sBPF ISA](https://bpf.wtf/sol-0x03-isa). Richard Patel's consolidation of `solana_rbpf`, the disassembler, the Solana LLVM fork, and Capstone into one reference. Useful for: opcode hex bytes, the three competing assembler dialects, the `lddw` "it is really a 64-bit mov" clarifier, and the `le` / `be` encoding.
+- [Solana sBPF specification](https://github.com/solana-foundation/specs/blob/main/runtime/sbpf.md). The Foundation's draft spec. Lags real runtime behaviour at times; cross-check against rbpf if anything looks off.
+- [`solana_rbpf` Rust API docs](https://docs.rs/solana_rbpf). The interpreter and JIT in source form, the closest thing to a reference implementation.
+
+## Syscall references
+
+- [bpf.wtf 0x04: syscalls](https://bpf.wtf/sol-0x04-syscalls). The dispatch mechanism (Murmur3 hash in the `call` immediate), the registry concept, and the per-syscall behaviour notes.
+- [Agave syscall definitions](https://github.com/anza-xyz/agave/tree/master/programs/bpf_loader/src/syscalls). The actual code each `call <name>` reaches. Read this when a syscall behaves in a way the docs do not predict.
+- [Pinocchio syscall bindings](https://github.com/anza-xyz/pinocchio/tree/main/sdk/pinocchio/src/syscalls). The Rust-side declarations of the same syscalls; useful when porting a Pinocchio reference implementation to asm.
+
+## Guides and tutorials
+
+- [Helius: How to write Solana programs in sBPF assembly](https://www.helius.dev/blog/how-to-write-solana-programs-in-sbpf-assembly). Article-length walkthrough of a single program.
+- [Blueshift course: sBPF assembly track](https://learn.blueshift.gg/en/courses/introduction-to-assembly). Multi-lesson course with exercises.
+- [dasmac opcode guide](https://opcodes.dasmac.com/). Example-first reference. Each opcode and syscall links to a short program that exercises it; useful when you want to see an instruction in context.
+
+## Example repositories
+
+Hand-written programs to read after the [Example Programs](/docs/program-development/example-programs) chapter.
+
+- [`solana-developers/program-examples`](https://github.com/solana-developers/program-examples). Anchor / Native / Steel / asm variants of the same program, side by side. Read for the comparison.
+- [`blueshift-gg/sbpf`](https://github.com/blueshift-gg/sbpf). The toolchain repo. `examples/` contains the canonical asm reference programs (`sbpf-asm-counter`, `sbpf-asm-vault`, `sbpf-asm-cpi`).
+- [`dasmac/hello-dasmac`](https://github.com/dasmac/hello-dasmac). asm and Pinocchio implementations of the same program, with a `dump.sh` that produces side-by-side disassembly. Useful for measuring Rust overhead on a problem you understand.
+- [`bidhan-a/sbpf-asm-escrow`](https://github.com/bidhan-a/sbpf-asm-escrow). Community-written escrow with SPL Token CPIs and a multi-PDA state machine.
+
+## Tools
+
+- [`sbpf`](https://github.com/blueshift-gg/sbpf). Assembler, deploy wrapper, disassembler. The toolchain this book targets.
+- [LiteSVM](https://github.com/LiteSVM/litesvm). In-process Solana runtime for tests. Faster than `solana-test-validator` and gives you direct access to compute unit counts.
+- [asm.sbpf.dev](https://asm.sbpf.dev). Browser playground. Edit, assemble, and inspect disassembly without leaving the tab.
+- [SBPF VS Code extension](https://marketplace.visualstudio.com/items?itemName=deanmlittle.sbpf). Syntax highlighting and basic LSP features.
+
+## Talks
+
+- ["Writing Optimised Solana Programs"](https://www.youtube.com/watch?v=ID5cmS4Ipk0) by Dean Little. The motivating talk for most of this book's CU-conscious framing.
+
+## A note on freshness
+
+The Solana runtime changes between SIMDs. Opcodes are stable; syscall hashes are stable; the specific CU cost of a given syscall is not. Any number in this book or in the resources above is approximate, and the only way to get a real answer is to run your real program against the runtime version you intend to deploy on. Use [Compute Units](/docs/program-development/compute-units) as a planning tool and measurement as the source of truth.

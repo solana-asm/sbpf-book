@@ -1,0 +1,84 @@
+---
+title: "Shield: atomic safety checks for Solana transactions"
+description: "Seven tiny sBPF programs that turn slippage, deadlines, rent floors, and fee ceilings into hard atomic preconditions on any transaction, written in pure assembly and live on devnet and mainnet at the same program IDs."
+date: "2026-06-08"
+author: "Priyansh Patel"
+tags: ["shield", "sbpf", "guards", "launch"]
+---
+
+Most Solana actions have a "what if" attached to them. What if the swap pays out way less than expected? What if my keeper bot runs too late? What if this close drains the account below rent? Today you either trust the destination program to check these things, or you skip the check.
+
+[Shield](https://shield.sbpf.dev) is a third option. Each "what if" becomes its own tiny program. You prepend it to your real instruction inside the same transaction. Solana already has a rule: if any instruction in a transaction returns non-zero, the whole transaction aborts. So if the guard says "no", the swap (or transfer, or mint) never happens. No partial progress, no cleanup, no risk.
+
+The guards are written in raw sBPF assembly, not Anchor, not Pinocchio, not Rust. They are a few hundred bytes each and most of them cost less than 10 compute units, which is roughly free on a 1.4M CU budget.
+
+## The seven guards
+
+| Guard | CU (happy path) | What it asserts |
+|---|---:|---|
+| [`slot_deadline`](https://github.com/solana-asm/shield/blob/main/src/slot_deadline/slot_deadline.s) | 152 | current slot is at or below `max_slot` |
+| [`slippage`](https://github.com/solana-asm/shield/blob/main/src/slippage/slippage.s) | 7 | spl-token amount on account 0 is at or above `min_amount` |
+| [`balance_floor`](https://github.com/solana-asm/shield/blob/main/src/balance_floor/balance_floor.s) | 7 | account 0 holds at least `min_lamports` |
+| [`signer_allowlist`](https://github.com/solana-asm/shield/blob/main/src/signer_allowlist/signer_allowlist.s) | 25 (N=1) | signer is one of N pubkeys, and `is_signer == 1` |
+| [`fee_ceiling`](https://github.com/solana-asm/shield/blob/main/src/fee_ceiling/fee_ceiling.s) | 86 | every `SetComputeUnitPrice` in this tx is at or below the ceiling |
+| [`program_allowlist`](https://github.com/solana-asm/shield/blob/main/src/program_allowlist/program_allowlist.s) | 80 (N=1) | every other top-level ix targets a program on the allowlist |
+| [`compute_unit_floor`](https://github.com/solana-asm/shield/blob/main/src/compute_unit_floor/compute_unit_floor.s) | 93 | tx declares `SetComputeUnitLimit` of at least `min_units` |
+
+Each guard is a single-purpose program with its own pubkey, deployed at the same address on devnet and mainnet. You do not install a library. You point an instruction at the guard's program ID, pass it the numbers it needs to check, and put it in front of your real action.
+
+## How a guarded swap actually composes
+
+```ts
+import { Connection, PublicKey, Transaction } from "@solana/web3.js"
+import {
+  slotDeadlineIx,
+  slippageIx,
+  balanceFloorIx,
+  feeCeilingIx,
+} from "@solana-asm/shield"
+
+const slot = await connection.getSlot()
+
+const tx = new Transaction()
+tx.add(slotDeadlineIx({ maxSlot: BigInt(slot + 100) }))
+tx.add(feeCeilingIx({ maxMicroLamports: 5_000n }))
+tx.add(balanceFloorIx({ account: signer.publicKey, minLamports: 1_000_000n }))
+tx.add(slippageIx({ tokenAccount: outAta, minAmount: 1_000_000n }))
+tx.add(yourSwapInstruction)
+```
+
+On the happy path, the runtime executes guards left-to-right, each returns zero, and the swap runs. On the unhappy path, any guard returning non-zero aborts the entire transaction atomically: the slippage check, the swap, every state mutation, all undone. The chain returns to exactly the state it was in before the signature landed.
+
+The atomic guarantee is the only thing in this design we did not invent. Everything else is a thin layer over a property Solana already gives you.
+
+## Why pure assembly
+
+Three reasons, in order of weight.
+
+**Size.** A guard like `slippage` is a handful of memory reads and one comparison. In assembly that lands at ~400 bytes on chain. The same logic through Anchor lands at tens of kilobytes once the runtime, the IDL discriminator dispatch, and the standard validators are linked in. For a program that does one thing, the framework tax is the whole program.
+
+**Compute.** `slippage` is 7 CU. `balance_floor` is 7 CU. `slot_deadline` is 152 CU because it has to call `sol_get_clock_sysvar`. A swap with deadline, slippage, and balance-floor protection adds ~166 CU on top of the swap itself. At Solana's per-tx cap of 1.4M CU this is below the noise floor.
+
+**Audit clarity.** A few hundred bytes of assembly is something one person can read in an afternoon and convince themselves of. There is no derive macro to expand, no monomorphized helper to chase, no runtime to step through. The dispatch table is the program.
+
+We have a dedicated chapter on each idiom the guards use in [the sBPF book](/docs): the input layout the loader hands you at `r1`, the offset where instruction data lives, how to call a syscall by helper ID, and how to compose a `.s` file that builds with the [`sbpf`](https://github.com/blueshift-gg/sbpf) toolchain.
+
+## Where it runs
+
+- Live demo at [shield.sbpf.dev](https://shield.sbpf.dev). Builds a transaction with up to four guards, simulates against devnet or mainnet, shows per-guard CU cost and the abort log.
+- SDK on npm as [`@solana-asm/shield`](https://www.npmjs.com/package/@solana-asm/shield). Tree-shakeable, one builder per guard, runs in node and the browser.
+- All seven program IDs live at the same addresses on devnet and mainnet. See [the README](https://github.com/solana-asm/shield#program-ids) for the table.
+
+## Early traction
+
+![@solana-asm/shield on npm crossed 700 weekly downloads in its first week.](/shield-npm.png)
+
+[`@solana-asm/shield`](https://www.npmjs.com/package/@solana-asm/shield) crossed 700 weekly downloads in its first week on npm, before this post existed. Small absolute number, but encouraging for a package whose ergonomic surface is "one builder per guard, you opt into each one per instruction." Thanks to the keeper bot and agent runtime teams that picked it up early without us asking.
+
+## What is next
+
+The first set of guards covers the failure modes we kept seeing while writing keeper bots and agent flows. The interesting question is which other "what if"s belong in this shape. Candidates we are looking at: pyth price freshness, on-chain memo audit trails, nonce-based replay protection for off-chain-signed intents, and a generic SPL-Token `delegate` ceiling.
+
+If a guard belongs in Shield, it should answer one yes/no question, be stateless, cost under ~200 CU, and produce a short `sol_log_` line before any non-zero exit so devnet diagnostics stay usable without a custom client. PRs against [the repo](https://github.com/solana-asm/shield) are welcome.
+
+Follow [@solana_asm](https://x.com/solana_asm) for the next guard.
